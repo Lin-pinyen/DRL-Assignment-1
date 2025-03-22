@@ -2,7 +2,6 @@ import numpy as np
 import pickle
 import random
 from collections import defaultdict
-import matplotlib.pyplot as plt
 from collections import deque
 import time
 class QLearningAgent:
