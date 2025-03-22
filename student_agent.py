@@ -652,7 +652,7 @@ def get_action(obs):
         
         for path in model_paths:
             try:
-                checkpoint = torch.load(path, map_location=_device)
+                checkpoint = torch.load(path, map_location=_device, weights_only=True)
                 _model.load_state_dict(checkpoint['policy_net'])
                 _model.eval()  # 設置為評估模式
                 print(f"成功加載模型: {path}")
