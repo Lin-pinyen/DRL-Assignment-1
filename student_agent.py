@@ -5,7 +5,7 @@ import time
 import random
 import math
 from IPython.display import clear_output
-
+import os 
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -597,32 +597,82 @@ def train_dqn(env, agent, num_episodes=1000, save_interval=200, render_interval=
         'dropoff_success_rate': dropoff_success_rate
     }
 
-def student_agent_get_action(obs):
+# def student_agent_get_action(obs):
+#     """
+#     用于最终提交的函数，从环境观察返回行动
+#     """
+#     # 1. 加载模型
+#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+#     # 创建一个临时agent对象，仅用于加载模型
+#     state_dim = len(process_state_for_network(obs))
+#     action_dim = 6
+#     agent = DQNAgent(state_dim, action_dim, device)
+    
+#     # 加载预训练模型
+#     agent.load_model("best_taxi_model.pth")
+    
+#     # 2. 处理观察
+#     processed_obs = process_state_for_network(obs)
+    
+#     # 3. 选择动作（测试模式，不需要探索）
+#     with torch.no_grad():
+#         state_tensor = torch.FloatTensor(processed_obs).unsqueeze(0).to(device)
+#         q_values = agent.policy_net(state_tensor)
+#         action = q_values.max(1)[1].item()
+    
+#     return action
+# 全局變量存儲模型
+_model = None
+_device = None
+def get_action(obs):
     """
-    用于最终提交的函数，从环境观察返回行动
+    評估函數：接收環境觀察並返回動作
+    
+    這是作業要求的主要函數，評估系統會調用此函數
     """
-    # 1. 加载模型
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    global _model, _device
     
-    # 创建一个临时agent对象，仅用于加载模型
-    state_dim = len(process_state_for_network(obs))
-    action_dim = 6
-    agent = DQNAgent(state_dim, action_dim, device)
+    # 首次調用時加載模型
+    if _model is None:
+        # 確定設備
+        _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # 計算狀態維度
+        processed_obs = process_state_for_network(obs)
+        state_dim = len(processed_obs)
+        action_dim = 6
+        
+        # 創建模型
+        _model = DuelingDQN(state_dim, action_dim).to(_device)
+        
+        # 嘗試加載模型，優先嘗試不同可能的路徑
+        model_paths = [
+            "best_taxi_model.pth",
+            "final_taxi_model.pth",
+            os.path.join(os.path.dirname(__file__), "best_taxi_model.pth"),
+            os.path.join(os.path.dirname(__file__), "final_taxi_model.pth")
+        ]
+        
+        for path in model_paths:
+            try:
+                checkpoint = torch.load(path, map_location=_device)
+                _model.load_state_dict(checkpoint['policy_net'])
+                _model.eval()  # 設置為評估模式
+                print(f"成功加載模型: {path}")
+                break
+            except Exception as e:
+                continue
     
-    # 加载预训练模型
-    agent.load_model("best_taxi_model.pth")
-    
-    # 2. 处理观察
+    # 處理觀察並選擇動作
     processed_obs = process_state_for_network(obs)
     
-    # 3. 选择动作（测试模式，不需要探索）
     with torch.no_grad():
-        state_tensor = torch.FloatTensor(processed_obs).unsqueeze(0).to(device)
-        q_values = agent.policy_net(state_tensor)
+        state_tensor = torch.FloatTensor(processed_obs).unsqueeze(0).to(_device)
+        q_values = _model(state_tensor)
         action = q_values.max(1)[1].item()
     
     return action
-
 # 主函数
 if __name__ == "__main__":
     # 环境配置
