@@ -2,3 +2,5 @@ tqdm
 requests
 argparse
 torch
+numpy
+gymnasium
