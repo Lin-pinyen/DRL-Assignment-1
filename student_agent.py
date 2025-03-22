@@ -2,6 +2,7 @@ import numpy as np
 import pickle
 import random
 from collections import defaultdict
+import matplotlib.pyplot as plt
 from collections import deque
 import time
 class QLearningAgent:
@@ -193,7 +194,7 @@ def get_action(obs):
         get_action.agent = QLearningAgent(action_dim=6)
         try:
             # Try to load pre-trained Q-table
-            get_action.agent.load("best_q_table.pkl")
+            get_action.agent.load("final_q_table.pkl")
         except:
             print("Could not load Q-table, using fallback strategy")
         
@@ -510,14 +511,14 @@ if __name__ == "__main__":
         gamma=0.99,
         epsilon_start=1.0,
         epsilon_end=0.1,
-        epsilon_decay=0.9999
+        epsilon_decay=0.99995
     )
     
     # Train agent
     print("Starting Q-learning training...")
     start_time = time.time()
     
-    rewards = train(env, agent, num_episodes=10000, max_steps=100)
+    rewards = train(env, agent, num_episodes=30000, max_steps=100)
     
     training_time = time.time() - start_time
     print(f"Training completed in {training_time:.2f} seconds")
@@ -535,5 +536,5 @@ if __name__ == "__main__":
     print(f"Final Q-table size: {len(agent.q_table)}")
     print(f"Total successful pickups: {env.successful_pickups}")
     print(f"Total successful dropoffs: {env.successful_dropoffs}")
-    print(f"Pickup success rate: {env.successful_pickups/10000:.4f}")
-    print(f"Dropoff success rate: {env.successful_dropoffs/10000:.4f}")
+    print(f"Pickup success rate: {env.successful_pickups/30000:.4f}")
+    print(f"Dropoff success rate: {env.successful_dropoffs/30000:.4f}")
