@@ -1,30 +1,245 @@
 import numpy as np
+import pickle
 import random
-import math
-import os 
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
-from collections import deque, namedtuple
-
-# 使用namedtuple来存储经验，提高代码可读性
-Transition = namedtuple('Transition', ('state', 'action', 'reward', 'next_state', 'done'))
-
-class ReplayMemory:
-    def __init__(self, capacity):
-        self.memory = deque([], maxlen=capacity)
+from collections import defaultdict
+import matplotlib.pyplot as plt
+from collections import deque
+import time
+class QLearningAgent:
+    """
+    Q-Learning Agent for Taxi Environment
+    Uses tabular approach instead of neural networks
+    """
+    def __init__(self, action_dim=6, learning_rate=0.2, gamma=0.99,
+                 epsilon_start=1.0, epsilon_end=0.01, epsilon_decay=0.9999):
+        self.action_dim = action_dim
+        self.lr = learning_rate
+        self.gamma = gamma
         
-    def push(self, *args):
-        """Save a transition"""
-        self.memory.append(Transition(*args))
+        # Exploration parameters
+        self.epsilon = epsilon_start
+        self.epsilon_end = epsilon_end
+        self.epsilon_decay = epsilon_decay
         
-    def sample(self, batch_size):
-        return random.sample(self.memory, batch_size)
+        # Initialize Q-table with optimistic values to encourage exploration
+        self.q_table = defaultdict(lambda: np.zeros(action_dim) + 1.0)
+        
+        # Track state visits for adaptive learning rates
+        self.visit_counts = defaultdict(int)
     
-    def __len__(self):
-        return len(self.memory)
+    def select_action(self, state):
+        """Select action using epsilon-greedy policy"""
+        state_key = tuple(state)
+        self.visit_counts[state_key] += 1
+        
+        # Exploration
+        if random.random() < self.epsilon:
+            # Smart exploration - prioritize pickup/dropoff when at target
+            passenger_in_taxi = state[0]
+            dist_to_passenger = state[1]
+            dist_to_destination = state[2]
+            
+            if passenger_in_taxi and dist_to_destination == 0:
+                # At destination with passenger, try DROPOFF
+                return 5 if random.random() < 0.8 else random.randint(0, 5)
+            elif not passenger_in_taxi and dist_to_passenger == 0:
+                # At passenger location without passenger, try PICKUP
+                return 4 if random.random() < 0.8 else random.randint(0, 5)
+            else:
+                return random.randint(0, 5)
+        else:
+            # Exploitation - choose best action
+            return int(np.argmax(self.q_table[state_key]))
+    
+    def update(self, state, action, reward, next_state, done):
+        """Update Q-value using Q-learning update rule"""
+        state_key = tuple(state)
+        next_state_key = tuple(next_state)
+        
+        # Adaptive learning rate - decreases with more visits
+        effective_lr = self.lr / (1 + 0.05 * self.visit_counts[state_key])
+        
+        # Q-learning update formula
+        best_next_action = np.argmax(self.q_table[next_state_key])
+        td_target = reward + (1 - done) * self.gamma * self.q_table[next_state_key][best_next_action]
+        td_error = td_target - self.q_table[state_key][action]
+        self.q_table[state_key][action] += effective_lr * td_error
+    
+    def decay_epsilon(self):
+        """Decay epsilon value for exploration"""
+        self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
+    
+    def save(self, filepath="q_table.pkl"):
+        """Save Q-table to file"""
+        with open(filepath, 'wb') as f:
+            pickle.dump(dict(self.q_table), f)
+    
+    def load(self, filepath="q_table.pkl"):
+        """Load Q-table from file"""
+        try:
+            with open(filepath, 'rb') as f:
+                table = pickle.load(f)
+                self.q_table = defaultdict(lambda: np.zeros(self.action_dim), table)
+            print(f"Q-table loaded from {filepath}")
+            print(f"Q-table size: {len(self.q_table)}")
+        except Exception as e:
+            print(f"Error loading Q-table: {e}")
 
+def process_state(state):
+    """
+    Process the environment state into a simplified representation
+    for the Q-table to reduce state space and improve generalization
+    """
+    # Extract components from state
+    distances_to_stations = state[:4]
+    obstacles = state[4:8]
+    passenger_in_taxi = state[8]
+    distance_to_passenger = state[9]
+    distance_to_destination = state[10]
+    passenger_adjacent = state[11]
+    destination_adjacent = state[12]
+    
+    # Discretize distances (0-5 only)
+    disc_passenger_dist = min(5, int(distance_to_passenger))
+    disc_destination_dist = min(5, int(distance_to_destination))
+    
+    # Create simplified state representation
+    simplified_state = (
+        int(passenger_in_taxi),                     # Is passenger in taxi? (0/1)
+        disc_passenger_dist if not passenger_in_taxi else 0,  # Distance to passenger
+        disc_destination_dist if passenger_in_taxi else 0,    # Distance to destination
+        int(passenger_adjacent),                    # Is passenger adjacent? (0/1)
+        int(destination_adjacent),                  # Is destination adjacent? (0/1)
+        int(obstacles[0]),                          # North obstacle (0/1)
+        int(obstacles[1]),                          # South obstacle (0/1)
+        int(obstacles[2]),                          # East obstacle (0/1)
+        int(obstacles[3])                           # West obstacle (0/1)
+    )
+    
+    return simplified_state
+
+def train(env, agent, num_episodes=5000, max_steps=100):
+    """Train the Q-learning agent"""
+    rewards_history = []
+    best_avg_reward = -float('inf')
+    
+    for episode in range(num_episodes):
+        state, _ = env.reset()
+        state = process_state(state)
+        total_reward = 0
+        done = False
+        step = 0
+        
+        while not done and step < max_steps:
+            # Select action
+            action = agent.select_action(state)
+            
+            # Take action
+            next_state, reward, done, _ = env.step(action)
+            next_state = process_state(next_state)
+            
+            # Update Q-table
+            agent.update(state, action, reward, next_state, done)
+            
+            # Move to next state
+            state = next_state
+            total_reward += reward
+            step += 1
+        
+        # Decay exploration rate
+        agent.decay_epsilon()
+        
+        # Record results
+        rewards_history.append(total_reward)
+        
+        # Save best model
+        if len(rewards_history) >= 100:
+            avg_reward = np.mean(rewards_history[-100:])
+            if avg_reward > best_avg_reward:
+                best_avg_reward = avg_reward
+                agent.save("best_q_table.pkl")
+        
+        # Print progress
+        if episode % 10 == 0:
+            avg_reward = np.mean(rewards_history[-100:]) if len(rewards_history) >= 100 else np.mean(rewards_history)
+            pickup_rate = env.successful_pickups / (episode + 1)
+            dropoff_rate = env.successful_dropoffs / (episode + 1)
+            
+            print(f"Episode {episode}: Reward = {total_reward:.2f}, Avg = {avg_reward:.2f}, ε = {agent.epsilon:.4f}")
+            print(f"Pickups: {env.successful_pickups}, Dropoffs: {env.successful_dropoffs}")
+            print(f"Pickup Rate: {pickup_rate:.4f}, Dropoff Rate: {dropoff_rate:.4f}")
+            print(f"Q-table size: {len(agent.q_table)}")
+        
+        # Save intermediate models
+        if episode % 500 == 0 and episode > 0:
+            agent.save(f"q_table_episode_{episode}.pkl")
+    
+    # Save final model
+    agent.save("final_q_table.pkl")
+    
+    return rewards_history
+
+def get_action(obs):
+    """
+    Function for submission - Returns action based on observation
+    
+    Args:
+        obs: Environment observation
+        
+    Returns:
+        action: Integer action (0-5)
+    """
+    # Initialize agent if needed (only on first call)
+    if not hasattr(get_action, "agent"):
+        get_action.agent = QLearningAgent(action_dim=6)
+        try:
+            # Try to load pre-trained Q-table
+            get_action.agent.load("best_q_table.pkl")
+        except:
+            print("Could not load Q-table, using fallback strategy")
+        
+    # Process observation
+    processed_obs = process_state(obs)
+    state_key = tuple(processed_obs)
+    
+    # Check if we have this state in our Q-table
+    if state_key in get_action.agent.q_table:
+        # Use learned policy
+        return int(np.argmax(get_action.agent.q_table[state_key]))
+    else:
+        # Fallback strategy for unseen states
+        passenger_in_taxi = processed_obs[0]
+        dist_to_passenger = processed_obs[1]
+        dist_to_destination = processed_obs[2]
+        passenger_adjacent = processed_obs[3]
+        destination_adjacent = processed_obs[4]
+        obstacles = processed_obs[5:9]
+        
+        if passenger_in_taxi:
+            # Passenger is in taxi
+            if dist_to_destination == 0:
+                return 5  # DROPOFF
+            elif destination_adjacent:
+                return 5  # Try DROPOFF when adjacent
+            else:
+                # Move in any non-obstacle direction
+                for i, is_obstacle in enumerate(obstacles):
+                    if not is_obstacle:
+                        return i  # Return movement action
+                # All directions blocked, try anything
+                return random.randint(0, 3)
+        else:
+            # Passenger not in taxi
+            if dist_to_passenger == 0:
+                return 4  # PICKUP
+            elif passenger_adjacent:
+                return 4  # Try PICKUP when adjacent
+            else:
+                # Move in any non-obstacle direction
+                for i, is_obstacle in enumerate(obstacles):
+                    if not is_obstacle:
+                        return i  # Return movement action
+                return random.randint(0, 3)
 class SimpleTaxiEnv():
     def __init__(self, grid_size=5, fuel_limit=200):
         self.grid_size = grid_size
@@ -34,23 +249,19 @@ class SimpleTaxiEnv():
         self.stations = [(0, 0), (0, self.grid_size - 1),
                          (self.grid_size - 1, 0), (self.grid_size - 1, self.grid_size - 1)]
         self.passenger_loc = None
-        self.obstacles = set()  # 简易版无障碍物
+        self.obstacles = set()  # No obstacles in simplified version
         self.destination = None
 
-        # 统计数据
+        # Statistics
         self.successful_pickups = 0
         self.successful_dropoffs = 0
-        self.action_history = []
-        
-        # 记录最近到达过的位置，用于检测循环行为
         self.recent_positions = []
         self.position_history_limit = 20
         
     def reset(self):
-        """重置环境，确保 Taxi、乘客与目的地互不重叠"""
+        """Reset the environment"""
         self.current_fuel = self.fuel_limit
         self.passenger_picked_up = False
-        self.action_history = []
         self.recent_positions = []
         
         available_positions = [
@@ -66,7 +277,7 @@ class SimpleTaxiEnv():
         return self.get_state(), {}
 
     def step(self, action):
-        """更新环境状态并返回 (state, reward, done, info)"""
+        """Update environment state and return (state, reward, done, info)"""
         old_state = self.get_state()
         old_pos = self.taxi_pos
         
@@ -75,636 +286,255 @@ class SimpleTaxiEnv():
         reward = 0
         done = False
 
-        # 添加当前位置到历史记录
+        # Add position to history
         self.recent_positions.append(self.taxi_pos)
         if len(self.recent_positions) > self.position_history_limit:
             self.recent_positions.pop(0)
             
-        # 检测循环行为
+        # Check for repeating positions
         position_repeat_penalty = 0
         if len(self.recent_positions) > 5:
             position_counts = {}
             for pos in self.recent_positions:
                 position_counts[pos] = position_counts.get(pos, 0) + 1
-            # 如果某个位置重复超过3次，给予惩罚
+            # Penalize repeating positions
             for pos, count in position_counts.items():
                 if count > 3:
-                    position_repeat_penalty = -1.0 * count  # 惩罚与重复次数成比例
+                    position_repeat_penalty = -1.0 * count
             
-        # 根据动作更新位置（移动动作）
-        if action == 0:  # Move Down
-            next_row += 1
-        elif action == 1:  # Move Up
-            next_row -= 1
-        elif action == 2:  # Move Right
-            next_col += 1
-        elif action == 3:  # Move Left
-            next_col -= 1
-
-        if action in [0, 1, 2, 3]:
-            # 计算距离
+        # Handle movement actions
+        if action <= 3:  # Movement actions
+            # Calculate distances
             if self.passenger_picked_up:
                 old_distance = abs(taxi_row - self.destination[0]) + abs(taxi_col - self.destination[1])
             else:
                 old_distance = abs(taxi_row - self.passenger_loc[0]) + abs(taxi_col - self.passenger_loc[1])
         
-            # 处理移动
+            # Update position based on action
+            if action == 0:  # Move South
+                next_row += 1
+            elif action == 1:  # Move North
+                next_row -= 1
+            elif action == 2:  # Move East
+                next_col += 1
+            elif action == 3:  # Move West
+                next_col -= 1
+
+            # Handle movement
             if (next_row, next_col) in self.obstacles or not (0 <= next_row < self.grid_size and 0 <= next_col < self.grid_size):
-                reward -= 5
+                reward -= 5  # Penalty for hitting wall/obstacle
             else:
                 self.taxi_pos = (next_row, next_col)
                 if self.passenger_picked_up:
                     self.passenger_loc = self.taxi_pos
             
-            # 基础移动惩罚，降低为-0.05，鼓励更多探索
-            reward -= 0.05
+            # Movement penalty
+            reward -= 0.1
             
-            # 更合理的shaping rewards
+            # Shaping rewards
             if self.passenger_picked_up:
-                reward += 0.2  # 乘客在车上时的奖励
+                reward += 0.2  # Small reward for having passenger
                 new_distance = abs(self.taxi_pos[0] - self.destination[0]) + abs(self.taxi_pos[1] - self.destination[1])
-                # 更平滑的奖励梯度
-                if new_distance < old_distance:
-                    reward += 2.0  # 减少朝目标移动的奖励，让agent更灵活
-                elif new_distance > old_distance:
-                    reward -= 0.5  # 减少远离目标的惩罚
                 
-                # 接近目的地时的额外奖励
-                if new_distance == 1:  # 距离目的地仅1步
-                    reward += 3.0
-                elif new_distance == 0:  # 到达目的地
-                    reward += 10.0  # 强烈鼓励在有乘客时到达目的地
+                if new_distance < old_distance:
+                    reward += 1.0  # Reward for moving toward destination
+                elif new_distance > old_distance:
+                    reward -= 0.5  # Penalty for moving away
+                
+                # Extra reward for being close to destination
+                if new_distance == 1:
+                    reward += 2.0
+                elif new_distance == 0:
+                    reward += 5.0
             else:
                 new_distance = abs(self.taxi_pos[0] - self.passenger_loc[0]) + abs(self.taxi_pos[1] - self.passenger_loc[1])
-                if new_distance < old_distance:
-                    reward += 1.5
-                elif new_distance > old_distance:
-                    reward -= 0.4
                 
-                # 接近乘客时的额外奖励
-                if new_distance == 1:  # 距离乘客仅1步
+                if new_distance < old_distance:
+                    reward += 1.0  # Reward for moving toward passenger
+                elif new_distance > old_distance:
+                    reward -= 0.5  # Penalty for moving away
+                
+                # Extra reward for being close to passenger
+                if new_distance == 1:
                     reward += 2.0
-                elif new_distance == 0:  # 到达乘客位置
-                    reward += 5.0  # 强烈鼓励到达乘客位置
+                elif new_distance == 0:
+                    reward += 3.0
         else:
-            # 非移动动作处理
+            # Handle pickup/dropoff actions
             if action == 4:  # PICKUP
                 if self.passenger_picked_up:
-                    reward -= 5  # 减轻重复接客的惩罚
+                    reward -= 5  # Already have passenger
                 elif self.taxi_pos == self.passenger_loc:
                     self.passenger_picked_up = True
                     self.passenger_loc = self.taxi_pos
-                    reward += 30  # 增加接客奖励
+                    reward += 30  # Successful pickup
                     self.successful_pickups += 1
                 else:
-                    reward -= 5  # 减轻错误接客的惩罚
+                    reward -= 5  # Invalid pickup
             elif action == 5:  # DROPOFF
-               # 在step函數中的DROPOFF動作部分
                 if self.passenger_picked_up:
                     if self.taxi_pos == self.destination:
-                        reward += 500  # 提高從100到500，使其遠高於其他獎勵
+                        reward += 100  # Successful dropoff
                         done = True
                         self.successful_dropoffs += 1
                     else:
-                        reward -= 30  # 減輕對錯誤地點下客的懲罰
-        # 基础操作惩罚
-        reward -= 0.05
+                        reward -= 10  # Invalid dropoff location
+                else:
+                    reward -= 5  # No passenger to drop off
 
-        # 扣除燃料
+        # Reduce fuel
         self.current_fuel -= 1
         if self.current_fuel <= 0:
             reward -= 10
             done = True
 
-        # 检查新旧状态是否相同
+        # Check if state unchanged
         new_state = self.get_state()
         if old_state == new_state and old_pos == self.taxi_pos:
-            reward -= 1  # 减轻状态未变的惩罚
+            reward -= 1  # Penalty for no change
 
-        # 更新并检查最近行动
-        self.action_history.append(action)
-        if len(self.action_history) > 8:
-            self.action_history.pop(0)
-            
-        # 应用循环位置惩罚
+        # Apply position repeat penalty
         reward += position_repeat_penalty
 
-         # 如果乘客在车上，每一步额外奖励 +0.1
+        # Extra reward for having passenger
         if self.passenger_picked_up:
             reward += 0.2
+            
         return new_state, reward, done, {}
 
-    # def get_state(self):
-    #     """返回当前环境状态 (tuple)"""
-    #     taxi_row, taxi_col = self.taxi_pos
-    #     passenger_row, passenger_col = self.passenger_loc
-    #     destination_row, destination_col = self.destination
-        
-    #     # 检查周围障碍物
-    #     obstacle_north = int(taxi_row == 0 or (taxi_row-1, taxi_col) in self.obstacles)
-    #     obstacle_south = int(taxi_row == self.grid_size - 1 or (taxi_row+1, taxi_col) in self.obstacles)
-    #     obstacle_east  = int(taxi_col == self.grid_size - 1 or (taxi_row, taxi_col+1) in self.obstacles)
-    #     obstacle_west  = int(taxi_col == 0 or (taxi_row, taxi_col-1) in self.obstacles)
-        
-    #     # 检查乘客位置相对于Taxi的位置
-    #     passenger_loc_north = int((taxi_row - 1, taxi_col) == self.passenger_loc)
-    #     passenger_loc_south = int((taxi_row + 1, taxi_col) == self.passenger_loc)
-    #     passenger_loc_east  = int((taxi_row, taxi_col + 1) == self.passenger_loc)
-    #     passenger_loc_west  = int((taxi_row, taxi_col - 1) == self.passenger_loc)
-    #     passenger_loc_middle = int((taxi_row, taxi_col) == self.passenger_loc)
-    #     passenger_look = (passenger_loc_north or passenger_loc_south or 
-    #                       passenger_loc_east or passenger_loc_west or passenger_loc_middle)
-        
-    #     # 检查目的地位置相对于Taxi的位置
-    #     destination_loc_north = int((taxi_row - 1, taxi_col) == self.destination)
-    #     destination_loc_south = int((taxi_row + 1, taxi_col) == self.destination)
-    #     destination_loc_east  = int((taxi_row, taxi_col + 1) == self.destination)
-    #     destination_loc_west  = int((taxi_row, taxi_col - 1) == self.destination)
-    #     destination_loc_middle = int((taxi_row, taxi_col) == self.destination)
-    #     destination_look = (destination_loc_north or destination_loc_south or 
-    #                         destination_loc_east or destination_loc_west or destination_loc_middle)
-        
-    #     # 状态信息：添加乘客是否在车上作为状态的一部分
-    #     state = (taxi_row, taxi_col,
-    #              self.stations[0][0], self.stations[0][1],
-    #              self.stations[1][0], self.stations[1][1],
-    #              self.stations[2][0], self.stations[2][1],
-    #              self.stations[3][0], self.stations[3][1],
-    #              obstacle_north, obstacle_south, obstacle_east, obstacle_west,
-    #              passenger_look, destination_look, int(self.passenger_picked_up))  # 添加乘客是否在车上
-    #     return state
     def get_state(self):
-        """返回當前環境狀態 (tuple)，增加了taxi與passenger和destination的直接距離"""
+        """Return current environment state"""
         taxi_row, taxi_col = self.taxi_pos
         
-        # 計算 taxi 到四個站點的曼哈頓距離
+        # Calculate Manhattan distances to stations
         distances_to_stations = [abs(taxi_row - station[0]) + abs(taxi_col - station[1]) for station in self.stations]
         
-        # 計算 taxi 到乘客的曼哈頓距離
+        # Calculate Manhattan distance to passenger
         distance_to_passenger = abs(taxi_row - self.passenger_loc[0]) + abs(taxi_col - self.passenger_loc[1])
         
-        # 計算 taxi 到目的地的曼哈頓距離
+        # Calculate Manhattan distance to destination
         distance_to_destination = abs(taxi_row - self.destination[0]) + abs(taxi_col - self.destination[1])
         
-        # 障礙物信息：檢測 taxi 四個方向是否存在障礙物或越界
+        # Check for obstacles in each direction
         obstacle_north = int(taxi_row == 0 or (taxi_row - 1, taxi_col) in self.obstacles)
         obstacle_south = int(taxi_row == self.grid_size - 1 or (taxi_row + 1, taxi_col) in self.obstacles)
         obstacle_east = int(taxi_col == self.grid_size - 1 or (taxi_row, taxi_col + 1) in self.obstacles)
         obstacle_west = int(taxi_col == 0 or (taxi_row, taxi_col - 1) in self.obstacles)
         obstacles = [obstacle_north, obstacle_south, obstacle_east, obstacle_west]
         
-        # 乘客是否在車上
+        # Passenger status
         passenger_in_taxi = int(self.passenger_picked_up)
         
-        # 乘客和目的地與Taxi的相對位置標誌（是否在Taxi的相鄰位置）
-        passenger_adjacent = int(distance_to_passenger <= 1) 
+        # Check if passenger or destination is adjacent
+        passenger_adjacent = int(distance_to_passenger <= 1)
         destination_adjacent = int(distance_to_destination <= 1)
         
-        # 組合所有特徵成一個tuple
+        # Combine all features
         state = tuple(distances_to_stations + obstacles + 
                     [passenger_in_taxi, distance_to_passenger, distance_to_destination,
                     passenger_adjacent, destination_adjacent])
+        
         return state
 
-
-    def render_env(self, taxi_pos, action=None, step=None, fuel=None):
-        clear_output(wait=True)
-        grid = [['.'] * self.grid_size for _ in range(self.grid_size)]
-        
-        # 设置四个站点 (例如：R, G, Y, B)
-        grid[0][0] = 'R'
-        grid[0][self.grid_size - 1] = 'G'
-        grid[self.grid_size - 1][0] = 'Y'
-        grid[self.grid_size - 1][self.grid_size - 1] = 'B'
-        
-        # 显示 Taxi
-        ty, tx = taxi_pos
-        if 0 <= tx < self.grid_size and 0 <= ty < self.grid_size:
-            grid[ty][tx] = '🚖'
-            
-        print(f"\nStep: {step}")
-        print(f"Taxi Position: ({tx}, {ty})")
-        print(f"Fuel Left: {fuel}")
-        print(f"Last Action: {self.get_action_name(action)}")
-        print(f"Passenger Picked Up: {self.passenger_picked_up}")
-        print(f"Passenger Location: {self.passenger_loc}")
-        print(f"Destination: {self.destination}\n")
-        
-        for row in grid:
-            print(" ".join(row))
-        print("\n")
-
-    def get_action_name(self, action):
-        actions = ["Move South", "Move North", "Move East", "Move West", "Pick Up", "Drop Off"]
-        return actions[action] if action is not None else "None"
-
-class DuelingDQN(nn.Module):
-    def __init__(self, state_dim, action_dim):
-        super(DuelingDQN, self).__init__()
-        
-        # 特征提取层
-        self.feature_layer = nn.Sequential(
-            nn.Linear(state_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU()
-        )
-        
-        # 价值流
-        self.value_stream = nn.Sequential(
-            nn.Linear(64, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1)
-        )
-        
-        # 优势流
-        self.advantage_stream = nn.Sequential(
-            nn.Linear(64, 64),
-            nn.ReLU(),
-            nn.Linear(64, action_dim)
-        )
-    
-    def forward(self, state):
-        features = self.feature_layer(state)
-        values = self.value_stream(features)
-        advantages = self.advantage_stream(features)
-        # 计算Q值: Q(s,a) = V(s) + (A(s,a) - mean(A(s,:)))
-        qvals = values + (advantages - advantages.mean(dim=1, keepdim=True))
-        return qvals
-
-class DQNAgent:
-    def __init__(self, state_dim, action_dim, device, lr=3e-4, gamma=0.99, 
-                 epsilon_start=1.0, epsilon_end=0.01, epsilon_decay=0.998):
-        self.device = device
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        self.gamma = gamma
-        
-        # Epsilon策略参数
-        self.epsilon = epsilon_start
-        self.epsilon_end = epsilon_end
-        self.epsilon_decay = epsilon_decay
-        
-        # 使用Dueling DQN网络
-        self.policy_net = DuelingDQN(state_dim, action_dim).to(device)
-        self.target_net = DuelingDQN(state_dim, action_dim).to(device)
-        self.target_net.load_state_dict(self.policy_net.state_dict())
-        self.target_net.eval()
-        
-        # 使用Adam优化器，学习率稍低一些
-        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=lr)
-        # self.optimizer = optim.SGD(self.policy_net.parameters(), lr=lr, momentum=0.9)
-        
-        # 更大的回放缓冲区
-        self.memory = ReplayMemory(10000)
-        self.batch_size = 64
-        
-        # 探索奖励相关
-        self.state_counts = {}
-        self.explore_coef = 0.5  # 减小探索奖励系数
-        
-        # 添加学习率调度器
-        self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=200, gamma=0.5)
-        
-    def select_action(self, state):
-        # Epsilon-贪婪策略选择动作
-        if random.random() < self.epsilon:
-            action = random.randrange(self.action_dim)
-        else:
-            with torch.no_grad():
-                state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-                q_values = self.policy_net(state_tensor)
-                action = q_values.max(1)[1].item()
-        
-        # Epsilon递减
-        self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
-        return action
-    
-    def remember(self, state, action, reward, next_state, done):
-        self.memory.push(state, action, reward, next_state, done)
-    
-    def optimize_model(self):
-        if len(self.memory) < self.batch_size:
-            return
-        
-        transitions = self.memory.sample(self.batch_size)
-        batch = Transition(*zip(*transitions))
-        
-        state_batch = torch.FloatTensor(batch.state).to(self.device)
-        action_batch = torch.LongTensor(batch.action).unsqueeze(1).to(self.device)
-        reward_batch = torch.FloatTensor(batch.reward).to(self.device)
-        next_state_batch = torch.FloatTensor(batch.next_state).to(self.device)
-        done_batch = torch.FloatTensor(batch.done).to(self.device)
-        
-        # 计算当前Q值
-        q_values = self.policy_net(state_batch).gather(1, action_batch).squeeze(1)
-        
-        # Double DQN: 使用policy_net选择action，使用target_net评估
-        with torch.no_grad():
-            next_actions = self.policy_net(next_state_batch).max(1)[1].unsqueeze(1)
-            next_q_values = self.target_net(next_state_batch).gather(1, next_actions).squeeze(1)
-            expected_q_values = reward_batch + self.gamma * next_q_values * (1 - done_batch)
-        
-        # 使用Huber Loss，对于异常值更鲁棒
-        loss = F.smooth_l1_loss(q_values, expected_q_values)
-        
-        # 梯度优化
-        self.optimizer.zero_grad()
-        loss.backward()
-        # 梯度裁剪，防止梯度爆炸
-        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=1.0)
-        self.optimizer.step()
-        
-        return loss.item()
-    
-    def update_target_network(self):
-        """使用软更新策略更新目标网络"""
-        tau = 0.01  # 软更新系数
-        for target_param, policy_param in zip(self.target_net.parameters(), self.policy_net.parameters()):
-            target_param.data.copy_(tau * policy_param.data + (1 - tau) * target_param.data)
-    
-    def get_exploration_bonus(self, state):
-        """计算探索奖励"""
-        state_key = tuple(state)
-        self.state_counts[state_key] = self.state_counts.get(state_key, 0) + 1
-        bonus = self.explore_coef / math.sqrt(self.state_counts[state_key])
-        return bonus
-    
-    def save_model(self, path):
-        """保存模型"""
-        torch.save({
-            'policy_net': self.policy_net.state_dict(),
-            'target_net': self.target_net.state_dict(),
-            'optimizer': self.optimizer.state_dict(),
-            'epsilon': self.epsilon
-        }, path)
-    
-    def load_model(self, path):
-        """加载模型"""
-        checkpoint = torch.load(path)
-        self.policy_net.load_state_dict(checkpoint['policy_net'])
-        self.target_net.load_state_dict(checkpoint['target_net'])
-        self.optimizer.load_state_dict(checkpoint['optimizer'])
-        self.epsilon = checkpoint['epsilon']
-
-def process_state_for_network(state):
-    """
-    處理 get_state() 返回的狀態，現在狀態包含：
-      - 到4個站點的距離 (4個值)
-      - 障礙物信息 (4個值)
-      - 乘客是否在車上 (1個值)
-      - 到乘客的距離 (1個值)
-      - 到目的地的距離 (1個值)
-      - 乘客是否在相鄰位置 (1個值)
-      - 目的地是否在相鄰位置 (1個值)
-    """
-    # 假設最大曼哈頓距離為環境大小的2倍
-    max_distance = 10.0  # 對於5x5環境，最大距離是8，稍微放寬一點
-    
-    # 歸一化到站點的距離
-    distances_to_stations = [s / max_distance for s in state[:4]]
-    
-    # 障礙物信息，不需要歸一化
-    obstacles = list(state[4:8])
-    
-    # 乘客是否在車上
-    passenger_in_taxi = [state[8]]
-    
-    # 歸一化到乘客和目的地的距離
-    distance_to_passenger = [state[9] / max_distance]
-    distance_to_destination = [state[10] / max_distance]
-    
-    # 乘客和目的地是否在相鄰位置
-    passenger_adjacent = [state[11]]
-    destination_adjacent = [state[12]]
-    
-    # 合併所有特徵
-    processed_state = (distances_to_stations + obstacles + passenger_in_taxi + 
-                       distance_to_passenger + distance_to_destination + 
-                       passenger_adjacent + destination_adjacent)
-    
-    return processed_state
-
-def train_dqn(env, agent, num_episodes=1000, save_interval=200, render_interval=100):
-    """训练DQN代理"""
+def evaluate_agent(env, agent, num_episodes=50):
+    """Evaluate agent performance without exploration"""
     total_rewards = []
-    avg_rewards = []  # 保存平均奖励
-    best_avg_reward = -float('inf')
-    episode_lengths = []
+    success_count = 0
     
-    # 每个episode的统计数据
-    pickup_success_rate = []
-    dropoff_success_rate = []
-    
-    # 每render_interval次评估一下模型
-    evaluation_rewards = []
-    
-    for episode in range(num_episodes):
+    for i in range(num_episodes):
         state, _ = env.reset()
-        processed_state = process_state_for_network(state)
-        episode_reward = 0
+        state = process_state(state)
         done = False
-        step_count = 0
+        total_reward = 0
+        step = 0
         
-        pickup_attempted = False
-        dropoff_attempted = False
-        
-        while not done:
-            # 选择动作
-            action = agent.select_action(processed_state)
-            
-            # 记录尝试的接客和送客
-            if action == 4:  # PICKUP
-                pickup_attempted = True
-            elif action == 5:  # DROPOFF
-                dropoff_attempted = True
-            
-            # 执行动作
-            next_state, reward, done, _ = env.step(action)
-            processed_next_state = process_state_for_network(next_state)
-            
-            # 计算探索奖励（可选）
-            if episode < num_episodes // 2:  # 只在前半部分训练中使用探索奖励
-                bonus = agent.get_exploration_bonus(processed_next_state)
-                total_reward = reward + bonus
+        while not done and step < 100:
+            # Use greedy action selection
+            state_key = tuple(state)
+            if state_key in agent.q_table:
+                action = np.argmax(agent.q_table[state_key])
             else:
-                total_reward = reward
+                # Fallback for unseen states
+                action = random.randint(0, 5)
             
-            # 存储经验
-            agent.remember(processed_state, action, total_reward, processed_next_state, done)
+            next_state, reward, done, _ = env.step(action)
+            next_state = process_state(next_state)
             
-            # 优化模型
-            loss = agent.optimize_model()
+            state = next_state
+            total_reward += reward
+            step += 1
             
-            # 软更新目标网络
-            agent.update_target_network()
-            
-            # 更新状态
-            processed_state = processed_next_state
-            episode_reward += reward
-            step_count += 1
-            
-            # 防止过长的episode
-            if step_count >= 100:
-                done = True
+            if done and reward > 50:  # Successfully completed task
+                success_count += 1
         
-        # 记录统计数据
-        total_rewards.append(episode_reward)
-        episode_lengths.append(step_count)
-        
-        # 计算最近100个episode的平均奖励
-        if len(total_rewards) >= 100:
-            avg_reward = np.mean(total_rewards[-100:])
-            avg_rewards.append(avg_reward)
-            
-            # 如果平均奖励提高，保存模型
-            if avg_reward > best_avg_reward:
-                best_avg_reward = avg_reward
-                agent.save_model("best_taxi_model.pth")
-        else:
-            avg_rewards.append(np.mean(total_rewards))
-        
-        # 计算接客和送客成功率
-        pickup_success = env.successful_pickups / max(1, episode + 1)
-        dropoff_success = env.successful_dropoffs / max(1, episode + 1)
-        pickup_success_rate.append(pickup_success)
-        dropoff_success_rate.append(dropoff_success)
-        
-        # 按指定间隔渲染环境和打印统计信息
-        if episode % 10 == 0:
-            print(f"Episode {episode+1}/{num_episodes}, Steps: {step_count}, "
-                  f"Reward: {episode_reward:.2f}, Avg Reward: {avg_rewards[-1]:.2f}, "
-                  f"Epsilon: {agent.epsilon:.4f}, Loss: {loss if loss else 'N/A'}")
-            print(f"Successful Pickups: {env.successful_pickups}, "
-                  f"Successful Dropoffs: {env.successful_dropoffs}, "
-                  f"Pickup Success Rate: {pickup_success:.4f}, "
-                  f"Dropoff Success Rate: {dropoff_success:.4f}")
-        
-        # 定期保存模型
-        if episode % save_interval == 0 and episode > 0:
-            agent.save_model(f"taxi_model_episode_{episode}.pth")
+        total_rewards.append(total_reward)
     
-    # 返回训练数据
-    return {
-        'rewards': total_rewards,
-        'avg_rewards': avg_rewards,
-        'episode_lengths': episode_lengths,
-        'pickup_success_rate': pickup_success_rate,
-        'dropoff_success_rate': dropoff_success_rate
-    }
+    avg_reward = np.mean(total_rewards)
+    success_rate = success_count / num_episodes
+    
+    return avg_reward, success_rate
 
-# def student_agent_get_action(obs):
-#     """
-#     用于最终提交的函数，从环境观察返回行动
-#     """
-#     # 1. 加载模型
-#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def plot_training_progress(rewards, window_size=100):
+    """Plot training progress"""
+    plt.figure(figsize=(12, 6))
     
-#     # 创建一个临时agent对象，仅用于加载模型
-#     state_dim = len(process_state_for_network(obs))
-#     action_dim = 6
-#     agent = DQNAgent(state_dim, action_dim, device)
+    # Plot episode rewards
+    plt.subplot(1, 2, 1)
+    plt.plot(rewards, alpha=0.6, color='blue', label='Episode Reward')
     
-#     # 加载预训练模型
-#     agent.load_model("best_taxi_model.pth")
+    # Plot moving average
+    if len(rewards) >= window_size:
+        moving_avg = np.convolve(rewards, np.ones(window_size)/window_size, mode='valid')
+        plt.plot(range(window_size-1, len(rewards)), moving_avg, color='red', label=f'{window_size}-Episode Moving Avg')
     
-#     # 2. 处理观察
-#     processed_obs = process_state_for_network(obs)
+    plt.xlabel('Episode')
+    plt.ylabel('Reward')
+    plt.title('Training Rewards')
+    plt.legend()
     
-#     # 3. 选择动作（测试模式，不需要探索）
-#     with torch.no_grad():
-#         state_tensor = torch.FloatTensor(processed_obs).unsqueeze(0).to(device)
-#         q_values = agent.policy_net(state_tensor)
-#         action = q_values.max(1)[1].item()
-    
-#     return action
-# 全局變量存儲模型
-_model = None
-_device = None
-def get_action(obs):
-    """
-    評估函數：接收環境觀察並返回動作
-    
-    這是作業要求的主要函數，評估系統會調用此函數
-    """
-    global _model, _device
-    
-    # 首次調用時加載模型
-    if _model is None:
-        # 確定設備
-        _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # 計算狀態維度
-        processed_obs = process_state_for_network(obs)
-        state_dim = len(processed_obs)
-        action_dim = 6
-        
-        # 創建模型
-        _model = DuelingDQN(state_dim, action_dim).to(_device)
-        
-        # 嘗試加載模型，優先嘗試不同可能的路徑
-        model_paths = [
-            "best_taxi_model.pth",
-            "final_taxi_model.pth",
-            os.path.join(os.path.dirname(__file__), "best_taxi_model.pth"),
-            os.path.join(os.path.dirname(__file__), "final_taxi_model.pth")
-        ]
-        
-        for path in model_paths:
-            try:
-                checkpoint = torch.load(path, map_location=_device, weights_only=True)
-                _model.load_state_dict(checkpoint['policy_net'])
-                _model.eval()  # 設置為評估模式
-                print(f"成功加載模型: {path}")
-                break
-            except Exception as e:
-                continue
-    
-    # 處理觀察並選擇動作
-    processed_obs = process_state_for_network(obs)
-    
-    with torch.no_grad():
-        state_tensor = torch.FloatTensor(processed_obs).unsqueeze(0).to(_device)
-        q_values = _model(state_tensor)
-        action = q_values.max(1)[1].item()
-    
-    return action
-# 主函数
+    plt.tight_layout()
+    plt.savefig('training_progress.png')
+    plt.show()
+
 if __name__ == "__main__":
-    # 环境配置
-    env_config = {
-        "grid_size": 5,
-        "fuel_limit": 1000
-    }
-    env = SimpleTaxiEnv(**env_config)
+    # Set random seeds for reproducibility
+    np.random.seed(42)
+    random.seed(42)
     
-    # 获取状态维度
-    sample_state, _ = env.reset()
-    processed_sample = process_state_for_network(sample_state)
-    state_dim = len(processed_sample)
-    action_dim = 6
+    # Initialize environment
+    env = SimpleTaxiEnv(grid_size=5, fuel_limit=200)
     
-    # 设置设备
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    # Create Q-learning agent
+    agent = QLearningAgent(
+        action_dim=6,
+        learning_rate=0.2,
+        gamma=0.99,
+        epsilon_start=1.0,
+        epsilon_end=0.1,
+        epsilon_decay=0.9999
+    )
     
-    # 创建DQN代理
-    agent = DQNAgent(state_dim, action_dim, device, lr=5e-4, gamma=0.99,
-                 epsilon_start=1.0, epsilon_end=0.1, epsilon_decay=0.99999)  # 加快epsilon衰減
+    # Train agent
+    print("Starting Q-learning training...")
+    start_time = time.time()
     
-    # 训练代理
-    train_results = train_dqn(env, agent, num_episodes=2000, save_interval=200)
+    rewards = train(env, agent, num_episodes=10000, max_steps=100)
     
-    # 打印最终统计信息
-    print("训练结束！")
-    print(f"Total Successful Pickups: {env.successful_pickups}")
-    print(f"Total Successful Dropoffs: {env.successful_dropoffs}")
-    print(f"Final Pickup Success Rate: {env.successful_pickups/2000:.4f}")
-    print(f"Final Dropoff Success Rate: {env.successful_dropoffs/2000:.4f}")
+    training_time = time.time() - start_time
+    print(f"Training completed in {training_time:.2f} seconds")
     
-    # 显示模型参数数量
-    num_params = sum(p.numel() for p in agent.policy_net.parameters() if p.requires_grad)
-    print(f"Number of trainable parameters in the DQN: {num_params}")
+    # Evaluate agent
+    print("\nEvaluating agent performance...")
+    avg_reward, success_rate = evaluate_agent(env, agent, num_episodes=100)
+    print(f"Evaluation - Avg Reward: {avg_reward:.2f}, Success Rate: {success_rate:.2f}")
     
-    # 保存最终模型
-    agent.save_model("final_taxi_model.pth")
+    # Plot training progress
+    plot_training_progress(rewards)
+    
+    # Print training statistics
+    print("\nTraining Statistics:")
+    print(f"Final Q-table size: {len(agent.q_table)}")
+    print(f"Total successful pickups: {env.successful_pickups}")
+    print(f"Total successful dropoffs: {env.successful_dropoffs}")
+    print(f"Pickup success rate: {env.successful_pickups/10000:.4f}")
+    print(f"Dropoff success rate: {env.successful_dropoffs/10000:.4f}")
