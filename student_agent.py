@@ -411,7 +411,7 @@ class DQNAgent:
     
     def load_model(self, path):
         try:
-            checkpoint = torch.load(path, map_location=torch.device('cpu'))
+            checkpoint = torch.load(path, map_location=torch.device('cpu'), weights_only=True)
             self.policy_net.load_state_dict(checkpoint['policy_net'])
             self.target_net.load_state_dict(checkpoint['target_net'])
             self.optimizer.load_state_dict(checkpoint['optimizer'])
