@@ -597,7 +597,7 @@ def train_dqn(env, agent, num_episodes=1000, save_interval=200, render_interval=
         'dropoff_success_rate': dropoff_success_rate
     }
 
-def student_agent_get_action(obs):
+def get_action(obs):
     """
     用于最终提交的函数，从环境观察返回行动
     """
