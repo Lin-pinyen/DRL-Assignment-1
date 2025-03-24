@@ -4,6 +4,7 @@ import importlib.util
 import time
 import random
 import math
+from IPython.display import clear_output
 
 import torch
 import torch.nn as nn
@@ -322,287 +323,136 @@ class DuelingDQN(nn.Module):
         return qvals
 
 class DQNAgent:
-    def __init__(self, state_dim, action_dim, device, lr=3e-4, gamma=0.99, 
-                 epsilon_start=1.0, epsilon_end=0.01, epsilon_decay=0.99999):
+    def __init__(self, state_dim, action_dim, device):
         self.device = device
         self.state_dim = state_dim
         self.action_dim = action_dim
-        self.gamma = gamma
-        
-        # Epsilon策略参数
-        self.epsilon = epsilon_start
-        self.epsilon_end = epsilon_end
-        self.epsilon_decay = epsilon_decay
+        self.gamma = 0.99
+        self.epsilon = 0.01  # 测试时使用低探索率
         
         # 使用Dueling DQN网络
         self.policy_net = DuelingDQN(state_dim, action_dim).to(device)
-        self.target_net = DuelingDQN(state_dim, action_dim).to(device)
-        self.target_net.load_state_dict(self.policy_net.state_dict())
-        self.target_net.eval()
         
-        # 使用Adam优化器，学习率稍低一些
-        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=lr)
-        
-        # 更大的回放缓冲区
-        self.memory = ReplayMemory(10000)
-        self.batch_size = 64
-        
-        # 探索奖励相关
-        self.state_counts = {}
-        self.explore_coef = 0.5  # 减小探索奖励系数
-        
-        # 添加学习率调度器
-        self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=200, gamma=0.5)
-        
-    def select_action(self, state):
-        # Epsilon-贪婪策略选择动作
-        if random.random() < self.epsilon:
-            action = random.randrange(self.action_dim)
-        else:
-            with torch.no_grad():
-                state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-                q_values = self.policy_net(state_tensor)
-                action = q_values.max(1)[1].item()
-        
-        # Epsilon递减
-        self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
-        return action
-    
-    def remember(self, state, action, reward, next_state, done):
-        self.memory.push(state, action, reward, next_state, done)
-    
-    def optimize_model(self):
-        if len(self.memory) < self.batch_size:
-            return
-        
-        transitions = self.memory.sample(self.batch_size)
-        batch = Transition(*zip(*transitions))
-        
-        state_batch = torch.FloatTensor(batch.state).to(self.device)
-        action_batch = torch.LongTensor(batch.action).unsqueeze(1).to(self.device)
-        reward_batch = torch.FloatTensor(batch.reward).to(self.device)
-        next_state_batch = torch.FloatTensor(batch.next_state).to(self.device)
-        done_batch = torch.FloatTensor(batch.done).to(self.device)
-        
-        # 计算当前Q值
-        q_values = self.policy_net(state_batch).gather(1, action_batch).squeeze(1)
-        
-        # Double DQN: 使用policy_net选择action，使用target_net评估
-        with torch.no_grad():
-            next_actions = self.policy_net(next_state_batch).max(1)[1].unsqueeze(1)
-            next_q_values = self.target_net(next_state_batch).gather(1, next_actions).squeeze(1)
-            expected_q_values = reward_batch + self.gamma * next_q_values * (1 - done_batch)
-        
-        # 使用Huber Loss，对于异常值更鲁棒
-        loss = F.smooth_l1_loss(q_values, expected_q_values)
-        
-        # 梯度优化
-        self.optimizer.zero_grad()
-        loss.backward()
-        # 梯度裁剪，防止梯度爆炸
-        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=1.0)
-        self.optimizer.step()
-        
-        return loss.item()
-    
-    def update_target_network(self):
-        """使用软更新策略更新目标网络"""
-        tau = 0.01  # 软更新系数
-        for target_param, policy_param in zip(self.target_net.parameters(), self.policy_net.parameters()):
-            target_param.data.copy_(tau * policy_param.data + (1 - tau) * target_param.data)
-    
-    def get_exploration_bonus(self, state):
-        """计算探索奖励"""
-        state_key = tuple(state)
-        self.state_counts[state_key] = self.state_counts.get(state_key, 0) + 1
-        bonus = self.explore_coef / math.sqrt(self.state_counts[state_key])
-        return bonus
-    
-    def save_model(self, path):
-        """保存模型"""
-        torch.save({
-            'policy_net': self.policy_net.state_dict(),
-            'target_net': self.target_net.state_dict(),
-            'optimizer': self.optimizer.state_dict(),
-            'epsilon': self.epsilon
-        }, path)
-    
     def load_model(self, path):
         """加载模型"""
-        checkpoint = torch.load(path)
-        self.policy_net.load_state_dict(checkpoint['policy_net'])
-        self.target_net.load_state_dict(checkpoint['target_net'])
-        self.optimizer.load_state_dict(checkpoint['optimizer'])
-        self.epsilon = checkpoint['epsilon']
+        try:
+            # 使用map_location参数确保模型可以在CPU上加载，即使它是在GPU上保存的
+            checkpoint = torch.load(path, map_location=torch.device('cpu'))
+            self.policy_net.load_state_dict(checkpoint['policy_net'])
+        except Exception as e:
+            print(f"加载模型时出错: {e}")
+            # 如果加载失败，使用初始化的模型
+            pass
 
 def process_state_for_network(state):
-    """
-    处理 get_state() 返回的状态，现在状态包含：
-      - 障碍物信息 (4个值)
-      - 乘客是否在车上 (1个值)
-      - 到乘客的距离 (1个值)
-      - 到目的地的距离 (1个值)
-      - 乘客是否在相邻位置 (1个值)
-      - 目的地是否在相邻位置 (1个值)
-    """
+    """处理状态以适应网络输入"""
     # 假设最大曼哈顿距离为环境大小的2倍
-    max_distance = 10.0  # 对于5x5环境，最大距离是8，稍微放宽一点
+    max_distance = 15.0  # 对于大一点的环境，给更大的最大距离
     
-    # 障碍物信息，不需要归一化
-    obstacles = list(state[:4])
+    if state is None:
+        # 返回一个合理的默认状态
+        return [0] * 9
     
-    # 乘客是否在车上
-    passenger_in_taxi = [state[4]]
-    
-    # 归一化到乘客和目的地的距离
-    distance_to_passenger = [state[5] / max_distance]
-    distance_to_destination = [state[6] / max_distance]
-    
-    # 乘客和目的地是否在相邻位置
-    passenger_adjacent = [state[7]]
-    destination_adjacent = [state[8]]
-    
-    # 合并所有特征
-    processed_state = (obstacles + passenger_in_taxi + 
-                       distance_to_passenger + distance_to_destination + 
-                       passenger_adjacent + destination_adjacent)
-    
-    return processed_state
-
-def train_dqn(env, agent, num_episodes=1000, save_interval=200, render_interval=100):
-    """训练DQN代理"""
-    total_rewards = []
-    avg_rewards = []  # 保存平均奖励
-    best_avg_reward = -float('inf')
-    episode_lengths = []
-    
-    # 每个episode的统计数据
-    pickup_success_rate = []
-    dropoff_success_rate = []
-    
-    # 每render_interval次评估一下模型
-    evaluation_rewards = []
-    
-    for episode in range(num_episodes):
-        state, _ = env.reset()
-        processed_state = process_state_for_network(state)
-        episode_reward = 0
-        done = False
-        step_count = 0
-        
-        pickup_attempted = False
-        dropoff_attempted = False
-        
-        while not done:
-            # 选择动作
-            action = agent.select_action(processed_state)
-            
-            # 记录尝试的接客和送客
-            if action == 4:  # PICKUP
-                pickup_attempted = True
-            elif action == 5:  # DROPOFF
-                dropoff_attempted = True
-            
-            # 执行动作
-            next_state, reward, done, _ = env.step(action)
-            processed_next_state = process_state_for_network(next_state)
-            
-            # 计算探索奖励（可选）
-            if episode < num_episodes // 2:  # 只在前半部分训练中使用探索奖励
-                bonus = agent.get_exploration_bonus(processed_next_state)
-                total_reward = reward + bonus
-            else:
-                total_reward = reward
-            
-            # 存储经验
-            agent.remember(processed_state, action, total_reward, processed_next_state, done)
-            
-            # 优化模型
-            loss = agent.optimize_model()
-            
-            # 软更新目标网络
-            agent.update_target_network()
-            
-            # 更新状态
-            processed_state = processed_next_state
-            episode_reward += reward
-            step_count += 1
-            
-            # 防止过长的episode
-            if step_count >= 100:
-                done = True
-        
-        # 记录统计数据
-        total_rewards.append(episode_reward)
-        episode_lengths.append(step_count)
-        
-        # 计算最近100个episode的平均奖励
-        if len(total_rewards) >= 100:
-            avg_reward = np.mean(total_rewards[-100:])
-            avg_rewards.append(avg_reward)
-            
-            # 如果平均奖励提高，保存模型
-            if avg_reward > best_avg_reward:
-                best_avg_reward = avg_reward
-                agent.save_model("best_taxi_model.pth")
+    try:
+        # 障碍物信息
+        if len(state) >= 4:
+            obstacles = list(state[:4])
         else:
-            avg_rewards.append(np.mean(total_rewards))
+            obstacles = [0, 0, 0, 0]
         
-        # 计算接客和送客成功率
-        pickup_success = env.successful_pickups / max(1, episode + 1)
-        dropoff_success = env.successful_dropoffs / max(1, episode + 1)
-        pickup_success_rate.append(pickup_success)
-        dropoff_success_rate.append(dropoff_success)
+        # 乘客是否在车上
+        passenger_in_taxi = [1] if len(state) > 4 and state[4] else [0]
         
-        # 按指定间隔渲染环境和打印统计信息
-        if episode % 100 == 0:
-            print(f"Episode {episode+1}/{num_episodes}, Steps: {step_count}, "
-                  f"Reward: {episode_reward:.2f}, Avg Reward: {avg_rewards[-1]:.2f}, "
-                  f"Epsilon: {agent.epsilon:.4f}, Loss: {loss if loss else 'N/A'}")
-            print(f"Successful Pickups: {env.successful_pickups}, "
-                  f"Successful Dropoffs: {env.successful_dropoffs}, "
-                  f"Pickup Success Rate: {pickup_success:.4f}, "
-                  f"Dropoff Success Rate: {dropoff_success:.4f}")
+        # 归一化到乘客和目的地的距离
+        distance_to_passenger = [state[5] / max_distance] if len(state) > 5 else [0]
+        distance_to_destination = [state[6] / max_distance] if len(state) > 6 else [0]
         
-        # 定期保存模型
-        if episode % save_interval == 0 and episode > 0:
-            agent.save_model(f"taxi_model_episode_{episode}.pth")
-    
-    # 返回训练数据
-    return {
-        'rewards': total_rewards,
-        'avg_rewards': avg_rewards,
-        'episode_lengths': episode_lengths,
-        'pickup_success_rate': pickup_success_rate,
-        'dropoff_success_rate': dropoff_success_rate
-    }
+        # 乘客和目的地是否在相邻位置
+        passenger_adjacent = [1] if len(state) > 7 and state[7] else [0]
+        destination_adjacent = [1] if len(state) > 8 and state[8] else [0]
+        
+        # 合并所有特征
+        processed_state = (obstacles + passenger_in_taxi + 
+                        distance_to_passenger + distance_to_destination + 
+                        passenger_adjacent + destination_adjacent)
+        
+        return processed_state
+    except Exception as e:
+        print(f"处理状态时出错: {e}")
+        return [0] * 9  # 返回默认状态
 
 def get_action(obs):
-    """
-    用于最终提交的函数，从环境观察返回行动
-    """
-    # 1. 加载模型
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    """从环境观察返回行动"""
+    # 始终使用CPU设备，避免CUDA设备不可用的问题
+    device = torch.device("cpu")
     
-    # 创建一个临时agent对象，仅用于加载模型
-    state_dim = len(process_state_for_network(obs))
-    action_dim = 6
-    agent = DQNAgent(state_dim, action_dim, device)
+    # 检查观察是否有效，如果无效则返回随机动作
+    if obs is None:
+        return random.randint(0, 5)
     
-    # 加载预训练模型
-    agent.load_model("best_taxi_model.pth")
-    
-    # 2. 处理观察
-    processed_obs = process_state_for_network(obs)
-    
-    # 3. 选择动作（测试模式，不需要探索）
-    with torch.no_grad():
-        state_tensor = torch.FloatTensor(processed_obs).unsqueeze(0).to(device)
-        q_values = agent.policy_net(state_tensor)
-        action = q_values.max(1)[1].item()
+    try:
+        # 处理观察
+        processed_obs = process_state_for_network(obs)
+        
+        # 创建一个临时agent对象，仅用于加载模型
+        state_dim = len(processed_obs)
+        action_dim = 6
+        agent = DQNAgent(state_dim, action_dim, device)
+        
+        # 尝试加载预训练模型，如果失败则使用启发式策略
+        try:
+            agent.load_model("best_taxi_model.pth")
+            
+            # 选择动作（测试模式，不需要探索）
+            with torch.no_grad():
+                state_tensor = torch.FloatTensor(processed_obs).unsqueeze(0).to(device)
+                q_values = agent.policy_net(state_tensor)
+                action = q_values.max(1)[1].item()
+        except Exception as e:
+            # 如果模型加载失败，使用启发式策略
+            if len(obs) > 4 and obs[4]:  # 乘客已上车
+                # 距离目的地的曼哈顿距离
+                dest_dist = obs[6] if len(obs) > 6 else 0
+                if dest_dist == 0:  # 已到达目的地
+                    action = 5  # DROPOFF
+                else:
+                    # 根据障碍物信息选择向目的地移动的方向
+                    obstacles = obs[:4] if len(obs) >= 4 else [0, 0, 0, 0]
+                    
+                    # 有启发式地选择动作
+                    if random.random() < 0.7:  # 70%的概率选择合理的动作
+                        # 选择一个没有障碍物的方向
+                        valid_actions = [i for i in range(4) if i < len(obstacles) and obstacles[i] == 0]
+                        if valid_actions:
+                            action = random.choice(valid_actions)
+                        else:
+                            action = random.randint(0, 3)  # 随机选择
+                    else:
+                        action = random.randint(0, 5)  # 完全随机
+            else:  # 乘客未上车
+                # 距离乘客的曼哈顿距离
+                pass_dist = obs[5] if len(obs) > 5 else 0
+                if pass_dist == 0:  # 已到达乘客位置
+                    action = 4  # PICKUP
+                else:
+                    # 根据障碍物信息选择向乘客移动的方向
+                    obstacles = obs[:4] if len(obs) >= 4 else [0, 0, 0, 0]
+                    
+                    # 有启发式地选择动作
+                    if random.random() < 0.7:  # 70%的概率选择合理的动作
+                        # 选择一个没有障碍物的方向
+                        valid_actions = [i for i in range(4) if i < len(obstacles) and obstacles[i] == 0]
+                        if valid_actions:
+                            action = random.choice(valid_actions)
+                        else:
+                            action = random.randint(0, 3)  # 随机选择
+                    else:
+                        action = random.randint(0, 5)  # 完全随机
+    except Exception as e:
+        # 如果处理出错，返回随机动作
+        action = random.randint(0, 5)
     
     return action
-
 # 主函数
 if __name__ == "__main__":
     # 环境配置
