@@ -1,413 +1,96 @@
+import gym
 import numpy as np
-import random
-import pickle
+import importlib.util
 import time
-# import matplotlib.pyplot as plt
-from collections import defaultdict, deque
-import os
+import random
+import math
+from IPython.display import clear_output
 
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from collections import deque, namedtuple
 
-class HierarchicalAgent:
-    """
-    Hierarchical Reinforcement Learning Agent for Taxi Environment
-    Decomposes the task into 4 subtasks with specialized policies:
-    1. Navigate to passenger
-    2. Pick up passenger
-    3. Navigate to destination
-    4. Drop off passenger
-    """
-    def __init__(self):
-        # Initialize sub-policies (options)
-        self.navigate_to_passenger_policy = defaultdict(lambda: np.zeros(4) + 0.1)  # 4 movement actions
-        self.pickup_policy = defaultdict(lambda: np.zeros(1) + 0.1)                 # 1 pickup action
-        self.navigate_to_destination_policy = defaultdict(lambda: np.zeros(4) + 0.1) # 4 movement actions
-        self.dropoff_policy = defaultdict(lambda: np.zeros(1) + 0.1)                # 1 dropoff action
-        
-        # Meta-policy to choose between options
-        self.meta_policy = defaultdict(lambda: np.zeros(4) + 0.1)  # 4 options
-        
-        # Option names for debugging
-        self.option_names = ["Navigate_to_Passenger", "Pickup", "Navigate_to_Destination", "Dropoff"]
-        
-        # Flag to indicate whether models are loaded
-        self.loaded = False
-        
-    def load_policies(self, directory="./"):
-        """Load all policies from files"""
-        try:
-            # Load meta-policy
-            with open(os.path.join(directory, "meta_policy.pkl"), "rb") as f:
-                self.meta_policy = defaultdict(lambda: np.zeros(4) + 0.1, pickle.load(f))
-            
-            # Load sub-policies
-            with open(os.path.join(directory, "navigate_to_passenger_policy.pkl"), "rb") as f:
-                self.navigate_to_passenger_policy = defaultdict(lambda: np.zeros(4) + 0.1, pickle.load(f))
-                
-            with open(os.path.join(directory, "pickup_policy.pkl"), "rb") as f:
-                self.pickup_policy = defaultdict(lambda: np.zeros(1) + 0.1, pickle.load(f))
-                
-            with open(os.path.join(directory, "navigate_to_destination_policy.pkl"), "rb") as f:
-                self.navigate_to_destination_policy = defaultdict(lambda: np.zeros(4) + 0.1, pickle.load(f))
-                
-            with open(os.path.join(directory, "dropoff_policy.pkl"), "rb") as f:
-                self.dropoff_policy = defaultdict(lambda: np.zeros(1) + 0.1, pickle.load(f))
-                
-            self.loaded = True
-            print("All policies loaded successfully")
-        except Exception as e:
-            print(f"Error loading policies: {e}")
-            self.loaded = False
-            
-    def select_option(self, state):
-        """Select which option to execute using meta-policy"""
-        state_key = tuple(state)
-        
-        # Use hard-coded logic if policies not loaded or to override in certain situations
-        passenger_in_taxi = state[0]
-        distance_to_passenger = state[1]
-        distance_to_destination = state[2]
-        
-        # If at passenger location without passenger, force pickup
-        if not passenger_in_taxi and distance_to_passenger == 0:
-            return 1  # Pickup option
-        
-        # If at destination with passenger, force dropoff
-        if passenger_in_taxi and distance_to_destination == 0:
-            return 3  # Dropoff option
-        
-        # Otherwise use meta policy
-        if self.loaded:
-            return np.argmax(self.meta_policy[state_key])
-        else:
-            # Fallback strategy if models aren't loaded
-            if not passenger_in_taxi:
-                return 0  # Navigate to passenger
-            else:
-                return 2  # Navigate to destination
-    
-    def select_action(self, state, option):
-        """Select action based on the current option"""
-        state_key = tuple(state)
-        
-        if option == 0:  # Navigate to passenger
-            # Choose from the 4 movement actions (0-3)
-            if self.loaded:
-                action = np.argmax(self.navigate_to_passenger_policy[state_key])
-            else:
-                # Simple heuristic if policy not loaded
-                passenger_dir_y = np.sign(state[5] - state[3])  # passenger y - taxi y
-                passenger_dir_x = np.sign(state[6] - state[4])  # passenger x - taxi x
-                
-                # Prioritize y-axis movement
-                if passenger_dir_y > 0:
-                    action = 0  # Move south
-                elif passenger_dir_y < 0:
-                    action = 1  # Move north
-                elif passenger_dir_x > 0:
-                    action = 2  # Move east
-                elif passenger_dir_x < 0:
-                    action = 3  # Move west
-                else:
-                    action = 0  # Default
-            return int(action)
-            
-        elif option == 1:  # Pickup
-            return 4  # Pickup action
-            
-        elif option == 2:  # Navigate to destination
-            # Choose from the 4 movement actions (0-3)
-            if self.loaded:
-                action = np.argmax(self.navigate_to_destination_policy[state_key])
-            else:
-                # Simple heuristic if policy not loaded
-                dest_dir_y = np.sign(state[7] - state[3])  # destination y - taxi y
-                dest_dir_x = np.sign(state[8] - state[4])  # destination x - taxi x
-                
-                # Prioritize y-axis movement
-                if dest_dir_y > 0:
-                    action = 0  # Move south
-                elif dest_dir_y < 0:
-                    action = 1  # Move north
-                elif dest_dir_x > 0:
-                    action = 2  # Move east
-                elif dest_dir_x < 0:
-                    action = 3  # Move west
-                else:
-                    action = 0  # Default
-            return int(action)
-            
-        elif option == 3:  # Dropoff
-            return 5  # Dropoff action
-        
-        # Default fallback
-        return 0
+# 使用namedtuple来存储经验，提高代码可读性
+Transition = namedtuple('Transition', ('state', 'action', 'reward', 'next_state', 'done'))
 
-def process_state(state):
-    """
-    Process and normalize the environment state for HRL
-    Args:
-        state: Raw state tuple from the environment
-    Returns:
-        processed_state: Tuple with normalized and processed features
-    """
-    # Extract state components
-    distances_to_stations = list(state[:4])
-    obstacles = list(state[4:8])
-    passenger_in_taxi = state[8]
-    distance_to_passenger = state[9]
-    distance_to_destination = state[10]
-    passenger_adjacent = state[11]
-    destination_adjacent = state[12]
-    
-    # Max Manhattan distance in 5x5 grid
-    max_distance = 8
-    
-    # Get taxi position relative to 0,0 (can derive this from distances to stations)
-    # In a 5x5 grid, the corners are at (0,0), (0,4), (4,0), and (4,4)
-    stations = [(0, 0), (0, 4), (4, 0), (4, 4)]
-    
-    # Estimate taxi position based on distances to stations
-    # This is an approximation since we don't have the actual position
-    taxi_row = 0
-    taxi_col = 0
-    
-    # If we can match a pattern of distances that uniquely identifies a position, use it
-    # Otherwise use a heuristic approach
-    
-    # Attempt to derive taxi position from distances to corners
-    # In a square grid, we can use trilateration with Manhattan distances
-    d1 = distances_to_stations[0]  # Distance to (0,0)
-    d2 = distances_to_stations[1]  # Distance to (0,4)
-    d3 = distances_to_stations[2]  # Distance to (4,0)
-    
-    # These equations work for Manhattan distance in a grid:
-    # For a position (x,y), the Manhattan distances to corners satisfy:
-    # d1 = x + y (distance to 0,0)
-    # d2 = x + (4-y) (distance to 0,4) = x + 4 - y
-    # d3 = (4-x) + y (distance to 4,0) = 4 - x + y
-    
-    # From d1 and d2:
-    # d1 - d2 = x + y - (x + 4 - y) = 2y - 4
-    # y = (d1 - d2 + 4)/2
-    
-    # From d1 and d3:
-    # d1 - d3 = x + y - (4 - x + y) = 2x - 4
-    # x = (d1 - d3 + 4)/2
-    
-    try:
-        taxi_row = int((d1 - d2 + 4)/2)
-        taxi_col = int((d1 - d3 + 4)/2)
+class ReplayMemory:
+    def __init__(self, capacity):
+        self.memory = deque([], maxlen=capacity)
         
-        # Verify these values are in range
-        if not (0 <= taxi_row < 5 and 0 <= taxi_col < 5):
-            # If out of range, use fallback
-            taxi_row = 2  # Middle of grid
-            taxi_col = 2
-    except:
-        # Fallback if calculation fails
-        taxi_row = 2
-        taxi_col = 2
+    def push(self, *args):
+        """Save a transition"""
+        self.memory.append(Transition(*args))
+        
+    def sample(self, batch_size):
+        return random.sample(self.memory, batch_size)
     
-    # Passenger position can be inferred if it's at a station
-    passenger_row, passenger_col = 0, 0
-    if distance_to_passenger <= max_distance:
-        for i, (r, c) in enumerate(stations):
-            if distances_to_stations[i] == distance_to_passenger:
-                passenger_row, passenger_col = r, c
-                break
-    
-    # Destination position can be inferred if it's at a station
-    destination_row, destination_col = 0, 0
-    if distance_to_destination <= max_distance:
-        for i, (r, c) in enumerate(stations):
-            if distances_to_stations[i] == distance_to_destination:
-                destination_row, destination_col = r, c
-                break
-    
-    # Create processed state
-    processed_state = (
-        int(passenger_in_taxi),                      # 0: Is passenger in taxi?
-        min(max_distance, int(distance_to_passenger)), # 1: Distance to passenger (capped)
-        min(max_distance, int(distance_to_destination)), # 2: Distance to destination (capped)
-        int(taxi_row),                                # 3: Taxi row
-        int(taxi_col),                                # 4: Taxi column
-        int(passenger_row),                          # 5: Passenger row
-        int(passenger_col),                          # 6: Passenger column
-        int(destination_row),                        # 7: Destination row
-        int(destination_col),                        # 8: Destination column
-        int(obstacles[0]),                           # 9: North obstacle
-        int(obstacles[1]),                           # 10: South obstacle
-        int(obstacles[2]),                           # 11: East obstacle
-        int(obstacles[3])                            # 12: West obstacle
-    )
-    
-    return processed_state
+    def __len__(self):
+        return len(self.memory)
 
-def get_action(obs):
-    """
-    Required function for submission - Gets action based on observation
-    
-    Args:
-        obs: Raw observation from environment (state tuple)
-        
-    Returns:
-        action: Integer action (0-5)
-    """
-    # Initialize agent if not already done
-    if not hasattr(get_action, "agent"):
-        get_action.agent = HierarchicalAgent()
-        try:
-            # Try to load policies
-            get_action.agent.load_policies()
-        except Exception as e:
-            print(f"Error in agent initialization: {e}")
-    
-    # Process observation
-    processed_obs = process_state(obs)
-    
-    # Select option using meta-policy
-    option = get_action.agent.select_option(processed_obs)
-    
-    # Use fallback heuristic if no policy is loaded
-    if not get_action.agent.loaded:
-        # Direct hardcoded approach for better performance
-        passenger_in_taxi = processed_obs[0]
-        distance_to_passenger = processed_obs[1]
-        distance_to_destination = processed_obs[2]
-        
-        taxi_row, taxi_col = processed_obs[3], processed_obs[4]
-        passenger_row, passenger_col = processed_obs[5], processed_obs[6]
-        destination_row, destination_col = processed_obs[7], processed_obs[8]
-        obstacles = processed_obs[9:13]  # [North, South, East, West]
-        
-        # CASE 1: No passenger in taxi
-        if not passenger_in_taxi:
-            # At passenger location, pickup
-            if distance_to_passenger == 0:
-                return 4  # PICKUP
-            
-            # Navigate to passenger
-            # Decide direction (try to minimize Manhattan distance)
-            row_diff = passenger_row - taxi_row
-            col_diff = passenger_col - taxi_col
-            
-            # Prioritize larger distance first
-            if abs(row_diff) >= abs(col_diff):
-                # Move vertically
-                if row_diff > 0 and not obstacles[0]:  # Need to move South and not blocked
-                    return 0  # Move South
-                elif row_diff < 0 and not obstacles[1]:  # Need to move North and not blocked
-                    return 1  # Move North
-                # If vertical movement blocked, try horizontal
-                elif col_diff > 0 and not obstacles[2]:  # Need to move East and not blocked
-                    return 2  # Move East
-                elif col_diff < 0 and not obstacles[3]:  # Need to move West and not blocked
-                    return 3  # Move West
-            else:
-                # Move horizontally
-                if col_diff > 0 and not obstacles[2]:  # Need to move East and not blocked
-                    return 2  # Move East
-                elif col_diff < 0 and not obstacles[3]:  # Need to move West and not blocked
-                    return 3  # Move West
-                # If horizontal movement blocked, try vertical
-                elif row_diff > 0 and not obstacles[0]:  # Need to move South and not blocked
-                    return 0  # Move South
-                elif row_diff < 0 and not obstacles[1]:  # Need to move North and not blocked
-                    return 1  # Move North
-            
-            # If all preferred directions are blocked, find any unblocked direction
-            for i in range(4):
-                if not obstacles[i]:
-                    return i
-            
-            # All directions blocked (shouldn't happen in normal grid)
-            return 0
-            
-        # CASE 2: Passenger in taxi
-        else:
-            # At destination, dropoff
-            if distance_to_destination == 0:
-                return 5  # DROPOFF
-            
-            # Navigate to destination
-            row_diff = destination_row - taxi_row
-            col_diff = destination_col - taxi_col
-            
-            # Prioritize larger distance first
-            if abs(row_diff) >= abs(col_diff):
-                # Move vertically
-                if row_diff > 0 and not obstacles[0]:  # Need to move South and not blocked
-                    return 0  # Move South
-                elif row_diff < 0 and not obstacles[1]:  # Need to move North and not blocked
-                    return 1  # Move North
-                # If vertical movement blocked, try horizontal
-                elif col_diff > 0 and not obstacles[2]:  # Need to move East and not blocked
-                    return 2  # Move East
-                elif col_diff < 0 and not obstacles[3]:  # Need to move West and not blocked
-                    return 3  # Move West
-            else:
-                # Move horizontally
-                if col_diff > 0 and not obstacles[2]:  # Need to move East and not blocked
-                    return 2  # Move East
-                elif col_diff < 0 and not obstacles[3]:  # Need to move West and not blocked
-                    return 3  # Move West
-                # If horizontal movement blocked, try vertical
-                elif row_diff > 0 and not obstacles[0]:  # Need to move South and not blocked
-                    return 0  # Move South
-                elif row_diff < 0 and not obstacles[1]:  # Need to move North and not blocked
-                    return 1  # Move North
-            
-            # If all preferred directions are blocked, find any unblocked direction
-            for i in range(4):
-                if not obstacles[i]:
-                    return i
-            
-            # All directions blocked (shouldn't happen in normal grid)
-            return 0
-    
-    # If policies are loaded, use them
-    action = get_action.agent.select_action(processed_obs, option)
-    return action
 class SimpleTaxiEnv():
     def __init__(self, grid_size=5, fuel_limit=200):
         self.grid_size = grid_size
         self.fuel_limit = fuel_limit
         self.current_fuel = fuel_limit
         self.passenger_picked_up = False
-        self.stations = [(0, 0), (0, self.grid_size - 1),
-                         (self.grid_size - 1, 0), (self.grid_size - 1, self.grid_size - 1)]
         self.passenger_loc = None
-        self.obstacles = set()  # No obstacles in simplified version
+        self.obstacles = set()  # 将存储障碍物位置
         self.destination = None
+        self.obstacle_density = 0.1  # 障碍物密度 - 可调整
 
-        # Statistics
-        self.successful_pickups = 0        # Total successful pickups across all episodes
-        self.successful_dropoffs = 0       # Total successful dropoffs across all episodes
-        self.episode_pickup_success = False  # Whether pickup was successful in current episode
-        self.episode_dropoff_success = False # Whether dropoff was successful in current episode
+        # 统计数据
+        self.successful_pickups = 0
+        self.successful_dropoffs = 0
+        self.action_history = []
+        
+        # 记录最近到达过的位置，用于检测循环行为
         self.recent_positions = []
         self.position_history_limit = 20
         
     def reset(self):
-        """Reset the environment"""
+        """重置环境，生成随机障碍物并确保 Taxi、乘客与目的地互不重叠"""
         self.current_fuel = self.fuel_limit
         self.passenger_picked_up = False
+        self.action_history = []
         self.recent_positions = []
         
-        available_positions = [
-            (x, y) for x in range(self.grid_size) for y in range(self.grid_size)
-            if (x, y) not in self.stations and (x, y) not in self.obstacles
-        ]
-        self.taxi_pos = random.choice(available_positions)
+        # 重置障碍物
+        self.obstacles = set()
         
-        self.passenger_loc = random.choice(self.stations)
-        possible_destinations = [s for s in self.stations if s != self.passenger_loc]
-        self.destination = random.choice(possible_destinations)
+        # 生成随机障碍物
+        all_positions = [(x, y) for x in range(self.grid_size) for y in range(self.grid_size)]
+        num_obstacles = int(self.obstacle_density * self.grid_size * self.grid_size)
+        
+        # 随机选择位置作为障碍物
+        potential_obstacles = random.sample(all_positions, min(num_obstacles, len(all_positions)))
+        for pos in potential_obstacles:
+            self.obstacles.add(pos)
+        
+        # 随机生成可用位置（排除障碍物）
+        available_positions = [pos for pos in all_positions if pos not in self.obstacles]
+        
+        # 确保有足够的空间放置taxi、passenger和destination
+        if len(available_positions) < 3:
+            # 如果空间不足，减少障碍物
+            while len(available_positions) < 3:
+                if not self.obstacles:
+                    break
+                self.obstacles.pop()
+                available_positions = [pos for pos in all_positions if pos not in self.obstacles]
+        
+        # 随机选择不重叠的位置
+        sampled_positions = random.sample(available_positions, 3)  # 我们需要taxi、passenger和destination三个位置
+        
+        self.taxi_pos = sampled_positions[0]
+        self.passenger_loc = sampled_positions[1]
+        self.destination = sampled_positions[2]
         
         return self.get_state(), {}
 
     def step(self, action):
-        """Update environment state and return (state, reward, done, info)"""
+        """更新环境状态并返回 (state, reward, done, info)"""
         old_state = self.get_state()
         old_pos = self.taxi_pos
         
@@ -416,583 +99,547 @@ class SimpleTaxiEnv():
         reward = 0
         done = False
 
-        # Add position to history
+        # 添加当前位置到历史记录
         self.recent_positions.append(self.taxi_pos)
         if len(self.recent_positions) > self.position_history_limit:
             self.recent_positions.pop(0)
             
-        # Check for repeating positions
+        # 检测循环行为
         position_repeat_penalty = 0
         if len(self.recent_positions) > 5:
             position_counts = {}
             for pos in self.recent_positions:
                 position_counts[pos] = position_counts.get(pos, 0) + 1
-            # Penalize repeating positions
+            # 如果某个位置重复超过3次，给予惩罚
             for pos, count in position_counts.items():
                 if count > 3:
-                    position_repeat_penalty = -1.0 * count
+                    position_repeat_penalty = -1.0 * count  # 惩罚与重复次数成比例
             
-        # Handle movement actions
-        if action <= 3:  # Movement actions
-            # Calculate distances
+        # 根据动作更新位置（移动动作）
+        if action == 0:  # Move Down
+            next_row += 1
+        elif action == 1:  # Move Up
+            next_row -= 1
+        elif action == 2:  # Move Right
+            next_col += 1
+        elif action == 3:  # Move Left
+            next_col -= 1
+
+        if action in [0, 1, 2, 3]:
+            # 计算距离
             if self.passenger_picked_up:
                 old_distance = abs(taxi_row - self.destination[0]) + abs(taxi_col - self.destination[1])
             else:
                 old_distance = abs(taxi_row - self.passenger_loc[0]) + abs(taxi_col - self.passenger_loc[1])
         
-            # Update position based on action
-            if action == 0:  # Move South
-                next_row += 1
-            elif action == 1:  # Move North
-                next_row -= 1
-            elif action == 2:  # Move East
-                next_col += 1
-            elif action == 3:  # Move West
-                next_col -= 1
-
-            # Handle movement
+            # 处理移动
             if (next_row, next_col) in self.obstacles or not (0 <= next_row < self.grid_size and 0 <= next_col < self.grid_size):
-                reward -= 5  # Penalty for hitting wall/obstacle
+                reward -= 5
             else:
                 self.taxi_pos = (next_row, next_col)
                 if self.passenger_picked_up:
                     self.passenger_loc = self.taxi_pos
             
-            # Movement penalty
-            reward -= 0.1
+            # 基础移动惩罚，降低为-0.05，鼓励更多探索
+            reward -= 0.05
             
-            # Shaping rewards
+            # 更合理的shaping rewards
             if self.passenger_picked_up:
+                reward += 0.2  # 乘客在车上时的奖励
                 new_distance = abs(self.taxi_pos[0] - self.destination[0]) + abs(self.taxi_pos[1] - self.destination[1])
-                
+                # 更平滑的奖励梯度
                 if new_distance < old_distance:
-                    reward += 2.0  # Reward for moving toward destination
+                    reward += 2.0  # 减少朝目标移动的奖励，让agent更灵活
                 elif new_distance > old_distance:
-                    reward -= 0.5  # Penalty for moving away
+                    reward -= 0.5  # 减少远离目标的惩罚
                 
-                # Extra reward for being close to destination
-                if new_distance == 1:
+                # 接近目的地时的额外奖励
+                if new_distance == 1:  # 距离目的地仅1步
                     reward += 3.0
-                elif new_distance == 0:
-                    reward += 10.0
+                elif new_distance == 0:  # 到达目的地
+                    reward += 10.0  # 强烈鼓励在有乘客时到达目的地
             else:
                 new_distance = abs(self.taxi_pos[0] - self.passenger_loc[0]) + abs(self.taxi_pos[1] - self.passenger_loc[1])
-                
                 if new_distance < old_distance:
-                    reward += 1.5  # Reward for moving toward passenger
+                    reward += 0.5
                 elif new_distance > old_distance:
-                    reward -= 0.4  # Penalty for moving away
+                    reward -= 0.2
                 
-                # Extra reward for being close to passenger
-                if new_distance == 1:
-                    reward += 2.0
-                elif new_distance == 0:
-                    reward += 5.0
+                # 接近乘客时的额外奖励
+                if new_distance == 1:  # 距离乘客仅1步
+                    reward += 1
+                elif new_distance == 0:  # 到达乘客位置
+                    reward += 3.0  # 强烈鼓励到达乘客位置
         else:
-            # Handle pickup/dropoff actions
+            # 非移动动作处理
             if action == 4:  # PICKUP
                 if self.passenger_picked_up:
-                    reward -= 5  # Already have passenger
+                    reward -= 5  # 减轻重复接客的惩罚
                 elif self.taxi_pos == self.passenger_loc:
                     self.passenger_picked_up = True
                     self.passenger_loc = self.taxi_pos
-                    reward += 30  # Successful pickup
+                    reward += 30  # 增加接客奖励
                     self.successful_pickups += 1
                 else:
-                    reward -= 5  # Invalid pickup
+                    reward -= 5  # 减轻错误接客的惩罚
             elif action == 5:  # DROPOFF
+               # 在step函數中的DROPOFF動作部分
                 if self.passenger_picked_up:
                     if self.taxi_pos == self.destination:
-                        reward += 500  # Successful dropoff - high reward
+                        reward += 500  # 提高從100到500，使其遠高於其他獎勵
                         done = True
                         self.successful_dropoffs += 1
                     else:
-                        reward -= 30  # Invalid dropoff location - big penalty
-                else:
-                    reward -= 5  # No passenger to drop off
+                        reward -= 30  # 減輕對錯誤地點下客的懲罰
+        # 基础操作惩罚
+        reward -= 0.05
 
-        # Reduce fuel
+        # 扣除燃料
         self.current_fuel -= 1
         if self.current_fuel <= 0:
             reward -= 10
             done = True
 
-        # Check if state unchanged
+        # 检查新旧状态是否相同
         new_state = self.get_state()
         if old_state == new_state and old_pos == self.taxi_pos:
-            reward -= 1  # Penalty for no change
+            reward -= 1  # 减轻状态未变的惩罚
 
-        # Apply position repeat penalty
+        # 更新并检查最近行动
+        self.action_history.append(action)
+        if len(self.action_history) > 8:
+            self.action_history.pop(0)
+            
+        # 应用循环位置惩罚
         reward += position_repeat_penalty
 
-        # Extra reward for having passenger
+         # 如果乘客在车上，每一步额外奖励 +0.1
         if self.passenger_picked_up:
             reward += 0.2
-            
         return new_state, reward, done, {}
 
     def get_state(self):
-        """Return current environment state"""
+        """返回当前环境状态，不依赖固定站点位置"""
         taxi_row, taxi_col = self.taxi_pos
         
-        # Calculate Manhattan distances to stations
-        distances_to_stations = [abs(taxi_row - station[0]) + abs(taxi_col - station[1]) for station in self.stations]
-        
-        # Calculate Manhattan distance to passenger
+        # 计算 taxi 到乘客的曼哈顿距离
         distance_to_passenger = abs(taxi_row - self.passenger_loc[0]) + abs(taxi_col - self.passenger_loc[1])
         
-        # Calculate Manhattan distance to destination
+        # 计算 taxi 到目的地的曼哈顿距离
         distance_to_destination = abs(taxi_row - self.destination[0]) + abs(taxi_col - self.destination[1])
         
-        # Check for obstacles in each direction
+        # 障碍物信息：检测 taxi 四个方向是否存在障碍物或越界
         obstacle_north = int(taxi_row == 0 or (taxi_row - 1, taxi_col) in self.obstacles)
         obstacle_south = int(taxi_row == self.grid_size - 1 or (taxi_row + 1, taxi_col) in self.obstacles)
         obstacle_east = int(taxi_col == self.grid_size - 1 or (taxi_row, taxi_col + 1) in self.obstacles)
         obstacle_west = int(taxi_col == 0 or (taxi_row, taxi_col - 1) in self.obstacles)
         obstacles = [obstacle_north, obstacle_south, obstacle_east, obstacle_west]
         
-        # Passenger status
+        # 乘客是否在车上
         passenger_in_taxi = int(self.passenger_picked_up)
         
-        # Check if passenger or destination is adjacent
-        passenger_adjacent = int(distance_to_passenger <= 1)
+        # 乘客和目的地与Taxi的相对位置标志
+        passenger_adjacent = int(distance_to_passenger <= 1) 
         destination_adjacent = int(distance_to_destination <= 1)
         
-        # Combine all features
-        state = tuple(distances_to_stations + obstacles + 
+        # 组合所有特征成一个tuple
+        state = tuple(obstacles + 
                     [passenger_in_taxi, distance_to_passenger, distance_to_destination,
                     passenger_adjacent, destination_adjacent])
-        
         return state
 
-class HierarchicalTrainer:
-    """
-    Trainer for Hierarchical Reinforcement Learning Agent
-    """
-    def __init__(self, env, agent, save_dir="./"):
-        self.env = env
-        self.agent = agent
-        self.save_dir = save_dir
+    def render_env(self, taxi_pos, action=None, step=None, fuel=None):
+        clear_output(wait=True)
+        grid = [['.'] * self.grid_size for _ in range(self.grid_size)]
         
-        # Ensure save directory exists
-        os.makedirs(save_dir, exist_ok=True)
+        # 显示障碍物
+        for obstacle_pos in self.obstacles:
+            o_row, o_col = obstacle_pos
+            if 0 <= o_row < self.grid_size and 0 <= o_col < self.grid_size:
+                grid[o_row][o_col] = 'X'
         
-        # Learning parameters
-        self.meta_alpha = 0.2   # Learning rate for meta-controller
-        self.option_alpha = 0.3  # Learning rate for option policies
-        self.gamma = 0.99       # Discount factor
-        
-        # Exploration parameters
-        self.meta_epsilon = 0.3  # Exploration rate for meta-controller
-        self.option_epsilon = 0.2  # Exploration rate for option policies
-        self.epsilon_decay = 0.9999  # Epsilon decay rate
-        self.min_epsilon = 0.01  # Minimum epsilon
-        
-        # Option termination criteria
-        self.option_timeout = 10  # Maximum steps per option
-        
-        # Tracking variables
-        self.meta_state_visits = defaultdict(int)
-        self.option_state_visits = defaultdict(lambda: defaultdict(int))
-        self.total_rewards = []
-        self.episode_lengths = []
-        self.successful_pickups = []
-        self.successful_dropoffs = []
-        
-    def select_option(self, state, explore=True):
-        """Select an option using meta-policy with exploration"""
-        state_key = tuple(state)
-        self.meta_state_visits[state_key] += 1
-        
-        # Hard-coded logic for certain states to speed up learning
-        passenger_in_taxi = state[0]
-        distance_to_passenger = state[1]
-        distance_to_destination = state[2]
-        
-        # If at passenger location without passenger, force pickup
-        if not passenger_in_taxi and distance_to_passenger == 0:
-            return 1  # Pickup option
-        
-        # If at destination with passenger, force dropoff
-        if passenger_in_taxi and distance_to_destination == 0:
-            return 3  # Dropoff option
-        
-        # Exploration
-        if explore and random.random() < self.meta_epsilon:
-            if passenger_in_taxi:
-                # If we have passenger, prioritize navigate-to-destination
-                return 2 if random.random() < 0.8 else random.randint(0, 3)
-            else:
-                # If no passenger, prioritize navigate-to-passenger
-                return 0 if random.random() < 0.8 else random.randint(0, 3)
-        
-        # Exploitation - choose best option
-        return np.argmax(self.agent.meta_policy[state_key])
-    
-    def select_action(self, state, option, explore=True):
-        """Select an action using the option's policy with exploration"""
-        state_key = tuple(state)
-        if option not in self.option_state_visits:
-            self.option_state_visits[option] = defaultdict(int)
-        self.option_state_visits[option][state_key] += 1
-        
-        # Determine action space based on option
-        if option == 0:  # Navigate to passenger
-            if explore and random.random() < self.option_epsilon:
-                return random.randint(0, 3)  # 4 movement actions
-            return np.argmax(self.agent.navigate_to_passenger_policy[state_key])
+        # 显示乘客和目的地
+        p_row, p_col = self.passenger_loc
+        if 0 <= p_row < self.grid_size and 0 <= p_col < self.grid_size and not self.passenger_picked_up:
+            grid[p_row][p_col] = 'P'
             
-        elif option == 1:  # Pickup
-            return 4  # Pickup action
+        d_row, d_col = self.destination
+        if 0 <= d_row < self.grid_size and 0 <= d_col < self.grid_size:
+            grid[d_row][d_col] = 'D'
             
-        elif option == 2:  # Navigate to destination
-            if explore and random.random() < self.option_epsilon:
-                return random.randint(0, 3)  # 4 movement actions
-            return np.argmax(self.agent.navigate_to_destination_policy[state_key])
+        # 显示 Taxi
+        ty, tx = taxi_pos
+        if 0 <= tx < self.grid_size and 0 <= ty < self.grid_size:
+            grid[ty][tx] = '🚖'
             
-        elif option == 3:  # Dropoff
-            return 5  # Dropoff action
+        print(f"\nStep: {step}")
+        print(f"Taxi Position: ({tx}, {ty})")
+        print(f"Fuel Left: {fuel}")
+        print(f"Last Action: {self.get_action_name(action)}")
+        print(f"Passenger Picked Up: {self.passenger_picked_up}")
+        print(f"Passenger Location: {self.passenger_loc}")
+        print(f"Destination: {self.destination}\n")
         
-        # Default fallback
-        return 0
-    
-    def should_terminate_option(self, state, option, step_count):
-        """Determine if the current option should terminate"""
-        # Timeout check
-        if step_count >= self.option_timeout:
-            return True
-        
-        passenger_in_taxi = state[0]
-        distance_to_passenger = state[1]
-        distance_to_destination = state[2]
-        
-        # Option-specific termination conditions
-        if option == 0:  # Navigate to passenger
-            # Terminate if at passenger or picked up passenger
-            return distance_to_passenger == 0 or passenger_in_taxi
-            
-        elif option == 1:  # Pickup
-            # Always terminate after one step
-            return True
-            
-        elif option == 2:  # Navigate to destination
-            # Terminate if at destination or lost passenger
-            return distance_to_destination == 0 or not passenger_in_taxi
-            
-        elif option == 3:  # Dropoff
-            # Always terminate after one step
-            return True
-        
-        return False
-    
-    def update_meta_policy(self, state, option, reward, next_state, done):
-        """Update the meta-controller policy"""
-        state_key = tuple(state)
-        next_state_key = tuple(next_state)
-        
-        # Adaptive learning rate based on visits
-        effective_alpha = self.meta_alpha / (1 + 0.01 * self.meta_state_visits[state_key])
-        
-        # Current Q-value
-        current_q = self.agent.meta_policy[state_key][option]
-        
-        # Next Q-value (max Q for next state)
-        next_q = 0 if done else np.max(self.agent.meta_policy[next_state_key])
-        
-        # TD Update
-        td_target = reward + self.gamma * next_q
-        td_error = td_target - current_q
-        
-        # Update Q-value
-        self.agent.meta_policy[state_key][option] += effective_alpha * td_error
-    
-    def update_option_policy(self, option, state, action, reward, next_state, done):
-        """Update the option's policy"""
-        state_key = tuple(state)
-        next_state_key = tuple(next_state)
-        
-        # Adaptive learning rate based on visits
-        effective_alpha = self.option_alpha / (1 + 0.01 * self.option_state_visits[option][state_key])
-        
-        # Update based on option
-        if option == 0:  # Navigate to passenger
-            # Adjust action index (0-3 for movement)
-            action_idx = action
-            
-            # Current Q-value
-            current_q = self.agent.navigate_to_passenger_policy[state_key][action_idx]
-            
-            # Next Q-value
-            next_q = 0 if done else np.max(self.agent.navigate_to_passenger_policy[next_state_key])
-            
-            # TD Update
-            td_target = reward + self.gamma * next_q
-            td_error = td_target - current_q
-            
-            # Update Q-value
-            self.agent.navigate_to_passenger_policy[state_key][action_idx] += effective_alpha * td_error
-            
-        elif option == 1:  # Pickup
-            # Only one action (pickup = 4), so index is 0
-            current_q = self.agent.pickup_policy[state_key][0]
-            next_q = 0 if done else np.max(self.agent.pickup_policy[next_state_key])
-            
-            td_target = reward + self.gamma * next_q
-            td_error = td_target - current_q
-            
-            self.agent.pickup_policy[state_key][0] += effective_alpha * td_error
-            
-        elif option == 2:  # Navigate to destination
-            # Adjust action index (0-3 for movement)
-            action_idx = action
-            
-            current_q = self.agent.navigate_to_destination_policy[state_key][action_idx]
-            next_q = 0 if done else np.max(self.agent.navigate_to_destination_policy[next_state_key])
-            
-            td_target = reward + self.gamma * next_q
-            td_error = td_target - current_q
-            
-            self.agent.navigate_to_destination_policy[state_key][action_idx] += effective_alpha * td_error
-            
-        elif option == 3:  # Dropoff
-            # Only one action (dropoff = 5), so index is 0
-            current_q = self.agent.dropoff_policy[state_key][0]
-            next_q = 0 if done else np.max(self.agent.dropoff_policy[next_state_key])
-            
-            td_target = reward + self.gamma * next_q
-            td_error = td_target - current_q
-            
-            self.agent.dropoff_policy[state_key][0] += effective_alpha * td_error
-    
-    def train(self, num_episodes=5000, max_steps=200):
-        """Train the hierarchical agent"""
-        print(f"Starting training for {num_episodes} episodes...")
-        
-        for episode in range(num_episodes):
-            state, _ = self.env.reset()
-            state = process_state(state)
-            
-            episode_reward = 0
-            step_count = 0
-            done = False
-            
-            while not done and step_count < max_steps:
-                # Select option using meta-policy
-                option = self.select_option(state)
-                
-                # Execute option
-                option_reward = 0
-                option_step_count = 0
-                option_terminal = False
-                
-                # Store initial state for the option
-                option_initial_state = state
-                
-                while not done and not option_terminal and option_step_count < self.option_timeout:
-                    # Select action using option policy
-                    action = self.select_action(state, option)
-                    
-                    # Execute action in environment
-                    next_state_raw, reward, done, _ = self.env.step(action)
-                    next_state = process_state(next_state_raw)
-                    
-                    # Update option policy
-                    self.update_option_policy(option, state, action, reward, next_state, done)
-                    
-                    # Accumulate option reward
-                    option_reward += reward
-                    episode_reward += reward
-                    option_step_count += 1
-                    step_count += 1
-                    
-                    # Update state
-                    state = next_state
-                    
-                    # Check if option should terminate
-                    option_terminal = self.should_terminate_option(state, option, option_step_count)
-                
-                # Update meta-policy with cumulative option reward
-                self.update_meta_policy(option_initial_state, option, option_reward, state, done)
-                
-                # Decay exploration rates
-                self.meta_epsilon = max(self.min_epsilon, self.meta_epsilon * self.epsilon_decay)
-                self.option_epsilon = max(self.min_epsilon, self.option_epsilon * self.epsilon_decay)
-            
-            # Record episode results
-            self.total_rewards.append(episode_reward)
-            self.episode_lengths.append(step_count)
-            self.successful_pickups.append(self.env.successful_pickups)
-            self.successful_dropoffs.append(self.env.successful_dropoffs)
-            
-            # Print progress
-            if (episode + 1) % 50 == 0:
-                avg_reward = np.mean(self.total_rewards[-100:]) if len(self.total_rewards) >= 100 else np.mean(self.total_rewards)
-                print(f"Episode {episode+1}/{num_episodes}: Reward = {episode_reward:.2f}, "
-                      f"Avg Reward = {avg_reward:.2f}, Steps = {step_count}")
-                print(f"Meta ε: {self.meta_epsilon:.4f}, Option ε: {self.option_epsilon:.4f}")
-                print(f"Pickups: {self.env.successful_pickups}, Dropoffs: {self.env.successful_dropoffs}")
-                print(f"Table sizes: Meta={len(self.agent.meta_policy)}, "
-                      f"Nav.Pass={len(self.agent.navigate_to_passenger_policy)}, "
-                      f"Nav.Dest={len(self.agent.navigate_to_destination_policy)}")
-            
-            # Save policies periodically
-            if (episode + 1) % 500 == 0 or episode == num_episodes - 1:
-                self.save_policies()
-        
-        # Save final policies
-        self.save_policies()
-        
-        return {
-            'rewards': self.total_rewards,
-            'episode_lengths': self.episode_lengths,
-            'pickups': self.successful_pickups,
-            'dropoffs': self.successful_dropoffs
-        }
-    
-    def save_policies(self):
-        """Save all policies to files"""
-        # Save meta-policy
-        with open(os.path.join(self.save_dir, "meta_policy.pkl"), "wb") as f:
-            pickle.dump(dict(self.agent.meta_policy), f)
-        
-        # Save option policies
-        with open(os.path.join(self.save_dir, "navigate_to_passenger_policy.pkl"), "wb") as f:
-            pickle.dump(dict(self.agent.navigate_to_passenger_policy), f)
-        
-        with open(os.path.join(self.save_dir, "pickup_policy.pkl"), "wb") as f:
-            pickle.dump(dict(self.agent.pickup_policy), f)
-        
-        with open(os.path.join(self.save_dir, "navigate_to_destination_policy.pkl"), "wb") as f:
-            pickle.dump(dict(self.agent.navigate_to_destination_policy), f)
-        
-        with open(os.path.join(self.save_dir, "dropoff_policy.pkl"), "wb") as f:
-            pickle.dump(dict(self.agent.dropoff_policy), f)
-        
-        print("All policies saved successfully")
-    
-    def plot_results(self):
-        """Plot training results"""
-        plt.figure(figsize=(15, 10))
-        
-        # Plot rewards
-        plt.subplot(2, 2, 1)
-        plt.plot(self.total_rewards)
-        plt.title('Episode Rewards')
-        plt.xlabel('Episode')
-        plt.ylabel('Reward')
-        
-        # Plot moving average of rewards
-        plt.subplot(2, 2, 2)
-        window_size = 100
-        if len(self.total_rewards) >= window_size:
-            moving_avg = np.convolve(self.total_rewards, np.ones(window_size)/window_size, mode='valid')
-            plt.plot(range(window_size-1, len(self.total_rewards)), moving_avg)
-            plt.title(f'{window_size}-Episode Moving Average Reward')
-            plt.xlabel('Episode')
-            plt.ylabel('Average Reward')
-        
-        # Plot successful pickups and dropoffs
-        plt.subplot(2, 2, 3)
-        plt.plot(self.successful_pickups, label='Pickups')
-        plt.plot(self.successful_dropoffs, label='Dropoffs')
-        plt.title('Successful Pickups and Dropoffs')
-        plt.xlabel('Episode')
-        plt.ylabel('Count')
-        plt.legend()
-        
-        # Plot episode lengths
-        plt.subplot(2, 2, 4)
-        plt.plot(self.episode_lengths)
-        plt.title('Episode Lengths')
-        plt.xlabel('Episode')
-        plt.ylabel('Steps')
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.save_dir, 'training_results.png'))
-        plt.show()
+        for row in grid:
+            print(" ".join(row))
+        print("\n")
 
-def evaluate_agent(env, agent, num_episodes=100):
-    """Evaluate agent performance"""
-    total_rewards = []
-    success_count = 0
+    def get_action_name(self, action):
+        actions = ["Move South", "Move North", "Move East", "Move West", "Pick Up", "Drop Off"]
+        return actions[action] if action is not None else "None"
+
+class DuelingDQN(nn.Module):
+    def __init__(self, state_dim, action_dim):
+        super(DuelingDQN, self).__init__()
+        
+        # 特征提取层
+        self.feature_layer = nn.Sequential(
+            nn.Linear(state_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU()
+        )
+        
+        # 价值流
+        self.value_stream = nn.Sequential(
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+        
+        # 优势流
+        self.advantage_stream = nn.Sequential(
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, action_dim)
+        )
     
-    for i in range(num_episodes):
+    def forward(self, state):
+        features = self.feature_layer(state)
+        values = self.value_stream(features)
+        advantages = self.advantage_stream(features)
+        # 计算Q值: Q(s,a) = V(s) + (A(s,a) - mean(A(s,:)))
+        qvals = values + (advantages - advantages.mean(dim=1, keepdim=True))
+        return qvals
+
+class DQNAgent:
+    def __init__(self, state_dim, action_dim, device, lr=3e-4, gamma=0.99, 
+                 epsilon_start=1.0, epsilon_end=0.01, epsilon_decay=0.99999):
+        self.device = device
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.gamma = gamma
+        
+        # Epsilon策略参数
+        self.epsilon = epsilon_start
+        self.epsilon_end = epsilon_end
+        self.epsilon_decay = epsilon_decay
+        
+        # 使用Dueling DQN网络
+        self.policy_net = DuelingDQN(state_dim, action_dim).to(device)
+        self.target_net = DuelingDQN(state_dim, action_dim).to(device)
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.target_net.eval()
+        
+        # 使用Adam优化器，学习率稍低一些
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=lr)
+        
+        # 更大的回放缓冲区
+        self.memory = ReplayMemory(10000)
+        self.batch_size = 64
+        
+        # 探索奖励相关
+        self.state_counts = {}
+        self.explore_coef = 0.5  # 减小探索奖励系数
+        
+        # 添加学习率调度器
+        self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=200, gamma=0.5)
+        
+    def select_action(self, state):
+        # Epsilon-贪婪策略选择动作
+        if random.random() < self.epsilon:
+            action = random.randrange(self.action_dim)
+        else:
+            with torch.no_grad():
+                state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+                q_values = self.policy_net(state_tensor)
+                action = q_values.max(1)[1].item()
+        
+        # Epsilon递减
+        self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
+        return action
+    
+    def remember(self, state, action, reward, next_state, done):
+        self.memory.push(state, action, reward, next_state, done)
+    
+    def optimize_model(self):
+        if len(self.memory) < self.batch_size:
+            return
+        
+        transitions = self.memory.sample(self.batch_size)
+        batch = Transition(*zip(*transitions))
+        
+        state_batch = torch.FloatTensor(batch.state).to(self.device)
+        action_batch = torch.LongTensor(batch.action).unsqueeze(1).to(self.device)
+        reward_batch = torch.FloatTensor(batch.reward).to(self.device)
+        next_state_batch = torch.FloatTensor(batch.next_state).to(self.device)
+        done_batch = torch.FloatTensor(batch.done).to(self.device)
+        
+        # 计算当前Q值
+        q_values = self.policy_net(state_batch).gather(1, action_batch).squeeze(1)
+        
+        # Double DQN: 使用policy_net选择action，使用target_net评估
+        with torch.no_grad():
+            next_actions = self.policy_net(next_state_batch).max(1)[1].unsqueeze(1)
+            next_q_values = self.target_net(next_state_batch).gather(1, next_actions).squeeze(1)
+            expected_q_values = reward_batch + self.gamma * next_q_values * (1 - done_batch)
+        
+        # 使用Huber Loss，对于异常值更鲁棒
+        loss = F.smooth_l1_loss(q_values, expected_q_values)
+        
+        # 梯度优化
+        self.optimizer.zero_grad()
+        loss.backward()
+        # 梯度裁剪，防止梯度爆炸
+        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=1.0)
+        self.optimizer.step()
+        
+        return loss.item()
+    
+    def update_target_network(self):
+        """使用软更新策略更新目标网络"""
+        tau = 0.01  # 软更新系数
+        for target_param, policy_param in zip(self.target_net.parameters(), self.policy_net.parameters()):
+            target_param.data.copy_(tau * policy_param.data + (1 - tau) * target_param.data)
+    
+    def get_exploration_bonus(self, state):
+        """计算探索奖励"""
+        state_key = tuple(state)
+        self.state_counts[state_key] = self.state_counts.get(state_key, 0) + 1
+        bonus = self.explore_coef / math.sqrt(self.state_counts[state_key])
+        return bonus
+    
+    def save_model(self, path):
+        """保存模型"""
+        torch.save({
+            'policy_net': self.policy_net.state_dict(),
+            'target_net': self.target_net.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'epsilon': self.epsilon
+        }, path)
+    
+    def load_model(self, path):
+        """加载模型"""
+        checkpoint = torch.load(path)
+        self.policy_net.load_state_dict(checkpoint['policy_net'])
+        self.target_net.load_state_dict(checkpoint['target_net'])
+        self.optimizer.load_state_dict(checkpoint['optimizer'])
+        self.epsilon = checkpoint['epsilon']
+
+def process_state_for_network(state):
+    """
+    处理 get_state() 返回的状态，现在状态包含：
+      - 障碍物信息 (4个值)
+      - 乘客是否在车上 (1个值)
+      - 到乘客的距离 (1个值)
+      - 到目的地的距离 (1个值)
+      - 乘客是否在相邻位置 (1个值)
+      - 目的地是否在相邻位置 (1个值)
+    """
+    # 假设最大曼哈顿距离为环境大小的2倍
+    max_distance = 10.0  # 对于5x5环境，最大距离是8，稍微放宽一点
+    
+    # 障碍物信息，不需要归一化
+    obstacles = list(state[:4])
+    
+    # 乘客是否在车上
+    passenger_in_taxi = [state[4]]
+    
+    # 归一化到乘客和目的地的距离
+    distance_to_passenger = [state[5] / max_distance]
+    distance_to_destination = [state[6] / max_distance]
+    
+    # 乘客和目的地是否在相邻位置
+    passenger_adjacent = [state[7]]
+    destination_adjacent = [state[8]]
+    
+    # 合并所有特征
+    processed_state = (obstacles + passenger_in_taxi + 
+                       distance_to_passenger + distance_to_destination + 
+                       passenger_adjacent + destination_adjacent)
+    
+    return processed_state
+
+def train_dqn(env, agent, num_episodes=1000, save_interval=200, render_interval=100):
+    """训练DQN代理"""
+    total_rewards = []
+    avg_rewards = []  # 保存平均奖励
+    best_avg_reward = -float('inf')
+    episode_lengths = []
+    
+    # 每个episode的统计数据
+    pickup_success_rate = []
+    dropoff_success_rate = []
+    
+    # 每render_interval次评估一下模型
+    evaluation_rewards = []
+    
+    for episode in range(num_episodes):
         state, _ = env.reset()
-        state = process_state(state)
+        processed_state = process_state_for_network(state)
+        episode_reward = 0
         done = False
-        total_reward = 0
+        step_count = 0
+        
+        pickup_attempted = False
+        dropoff_attempted = False
         
         while not done:
-            # Select option
-            option = agent.select_option(state)
+            # 选择动作
+            action = agent.select_action(processed_state)
             
-            # Select action
-            action = agent.select_action(state, option)
+            # 记录尝试的接客和送客
+            if action == 4:  # PICKUP
+                pickup_attempted = True
+            elif action == 5:  # DROPOFF
+                dropoff_attempted = True
             
-            # Take step in environment
+            # 执行动作
             next_state, reward, done, _ = env.step(action)
-            next_state = process_state(next_state)
+            processed_next_state = process_state_for_network(next_state)
             
-            # Update state and rewards
-            state = next_state
-            total_reward += reward
+            # 计算探索奖励（可选）
+            if episode < num_episodes // 2:  # 只在前半部分训练中使用探索奖励
+                bonus = agent.get_exploration_bonus(processed_next_state)
+                total_reward = reward + bonus
+            else:
+                total_reward = reward
             
-            # Check for success
-            if done and env.successful_dropoffs > 0:
-                success_count += 1
+            # 存储经验
+            agent.remember(processed_state, action, total_reward, processed_next_state, done)
+            
+            # 优化模型
+            loss = agent.optimize_model()
+            
+            # 软更新目标网络
+            agent.update_target_network()
+            
+            # 更新状态
+            processed_state = processed_next_state
+            episode_reward += reward
+            step_count += 1
+            
+            # 防止过长的episode
+            if step_count >= 100:
+                done = True
         
-        total_rewards.append(total_reward)
+        # 记录统计数据
+        total_rewards.append(episode_reward)
+        episode_lengths.append(step_count)
+        
+        # 计算最近100个episode的平均奖励
+        if len(total_rewards) >= 100:
+            avg_reward = np.mean(total_rewards[-100:])
+            avg_rewards.append(avg_reward)
+            
+            # 如果平均奖励提高，保存模型
+            if avg_reward > best_avg_reward:
+                best_avg_reward = avg_reward
+                agent.save_model("best_taxi_model.pth")
+        else:
+            avg_rewards.append(np.mean(total_rewards))
+        
+        # 计算接客和送客成功率
+        pickup_success = env.successful_pickups / max(1, episode + 1)
+        dropoff_success = env.successful_dropoffs / max(1, episode + 1)
+        pickup_success_rate.append(pickup_success)
+        dropoff_success_rate.append(dropoff_success)
+        
+        # 按指定间隔渲染环境和打印统计信息
+        if episode % 100 == 0:
+            print(f"Episode {episode+1}/{num_episodes}, Steps: {step_count}, "
+                  f"Reward: {episode_reward:.2f}, Avg Reward: {avg_rewards[-1]:.2f}, "
+                  f"Epsilon: {agent.epsilon:.4f}, Loss: {loss if loss else 'N/A'}")
+            print(f"Successful Pickups: {env.successful_pickups}, "
+                  f"Successful Dropoffs: {env.successful_dropoffs}, "
+                  f"Pickup Success Rate: {pickup_success:.4f}, "
+                  f"Dropoff Success Rate: {dropoff_success:.4f}")
+        
+        # 定期保存模型
+        if episode % save_interval == 0 and episode > 0:
+            agent.save_model(f"taxi_model_episode_{episode}.pth")
     
-    avg_reward = np.mean(total_rewards)
-    success_rate = success_count / num_episodes
-    
-    print(f"Evaluation results over {num_episodes} episodes:")
-    print(f"Average Reward: {avg_reward:.2f}")
-    print(f"Success Rate: {success_rate:.2f}")
-    
-    return avg_reward, success_rate
+    # 返回训练数据
+    return {
+        'rewards': total_rewards,
+        'avg_rewards': avg_rewards,
+        'episode_lengths': episode_lengths,
+        'pickup_success_rate': pickup_success_rate,
+        'dropoff_success_rate': dropoff_success_rate
+    }
 
+def get_action(obs):
+    """
+    用于最终提交的函数，从环境观察返回行动
+    """
+    # 1. 加载模型
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # 创建一个临时agent对象，仅用于加载模型
+    state_dim = len(process_state_for_network(obs))
+    action_dim = 6
+    agent = DQNAgent(state_dim, action_dim, device)
+    
+    # 加载预训练模型
+    agent.load_model("best_taxi_model.pth")
+    
+    # 2. 处理观察
+    processed_obs = process_state_for_network(obs)
+    
+    # 3. 选择动作（测试模式，不需要探索）
+    with torch.no_grad():
+        state_tensor = torch.FloatTensor(processed_obs).unsqueeze(0).to(device)
+        q_values = agent.policy_net(state_tensor)
+        action = q_values.max(1)[1].item()
+    
+    return action
+
+# 主函数
 if __name__ == "__main__":
-    # Set random seed for reproducibility
-    random.seed(42)
-    np.random.seed(42)
+    # 环境配置
+    env_config = {
+        "grid_size": 5,
+        "fuel_limit": 1000
+    }
+    env = SimpleTaxiEnv(**env_config)
     
-    # Create save directory
-    save_dir = "./hrl_taxi_policies"
-    os.makedirs(save_dir, exist_ok=True)
+    # 获取状态维度
+    sample_state, _ = env.reset()
+    processed_sample = process_state_for_network(sample_state)
+    state_dim = len(processed_sample)
+    action_dim = 6
     
-    # Initialize environment
-    env = SimpleTaxiEnv(grid_size=5, fuel_limit=200)
+    # 设置设备
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
     
-    # Initialize hierarchical agent
-    agent = HierarchicalAgent()
+    # 创建DQN代理
+    agent = DQNAgent(state_dim, action_dim, device, lr=5e-4, gamma=0.99,
+                 epsilon_start=1.0, epsilon_end=0.1, epsilon_decay=0.99999)  # 加快epsilon衰减
     
-    # Initialize trainer
-    trainer = HierarchicalTrainer(env, agent, save_dir=save_dir)
+    # 训练代理
+    train_results = train_dqn(env, agent, num_episodes=2000, save_interval=200)
     
-    # Train agent
-    print("Starting training...")
-    start_time = time.time()
-    
-    results = trainer.train(num_episodes=5000, max_steps=200)
-    
-    training_time = time.time() - start_time
-    print(f"Training completed in {training_time:.2f} seconds")
-    
-    # Plot results
-    trainer.plot_results()
-    
-    # Evaluate agent
-    print("\nEvaluating agent...")
-    avg_reward, success_rate = evaluate_agent(env, agent, num_episodes=100)
-    
-    # Print final statistics
-    print("\nTraining Statistics:")
-    print(f"Total Episodes: 5000")
-    print(f"Final Meta-Policy Size: {len(agent.meta_policy)}")
-    print(f"Final Navigate-to-Passenger Policy Size: {len(agent.navigate_to_passenger_policy)}")
-    print(f"Final Navigate-to-Destination Policy Size: {len(agent.navigate_to_destination_policy)}")
+    # 打印最终统计信息
+    print("训练结束！")
     print(f"Total Successful Pickups: {env.successful_pickups}")
     print(f"Total Successful Dropoffs: {env.successful_dropoffs}")
-    print(f"Pickup Success Rate: {env.successful_pickups/5000:.4f}")
-    print(f"Dropoff Success Rate: {env.successful_dropoffs/5000:.4f}")
+    print(f"Final Pickup Success Rate: {env.successful_pickups/2000:.4f}")
+    print(f"Final Dropoff Success Rate: {env.successful_dropoffs/2000:.4f}")
+    
+    # 显示模型参数数量
+    num_params = sum(p.numel() for p in agent.policy_net.parameters() if p.requires_grad)
+    print(f"Number of trainable parameters in the DQN: {num_params}")
+    
+    # 保存最终模型
+    agent.save_model("final_taxi_model.pth")
