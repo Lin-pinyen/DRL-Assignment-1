@@ -444,7 +444,10 @@ class DQNAgent:
     
     def load_model(self, path):
         """加载模型"""
-        checkpoint = torch.load(path)
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        #test
+        # 加载模型，指定目标设备
+        checkpoint = torch.load(path, map_location=device, weights_only=True)
         self.policy_net.load_state_dict(checkpoint['policy_net'])
         self.target_net.load_state_dict(checkpoint['target_net'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
